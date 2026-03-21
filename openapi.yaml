@@ -1,0 +1,788 @@
+openapi: 3.1.0
+info:
+    title: llmgw
+    version: v1
+    description: Compact OpenAI-compatible LLM gateway with alias routing, capability filtering, fallbacks, SSE streaming, and provider-specific passthrough fields.
+servers:
+    - url: http://localhost:8081
+      description: Configured gateway listener
+tags:
+    - name: system
+      description: Health, readiness, metrics, and discovery endpoints.
+    - name: inference
+      description: OpenAI-compatible inference endpoints.
+    - name: docs
+      description: Generated spec and interactive docs.
+paths:
+    /docs:
+        get:
+            operationId: docs
+            summary: Interactive API docs
+            tags:
+                - docs
+            responses:
+                "200":
+                    description: HTML docs viewer backed by /openapi.yaml.
+                    content:
+                        text/html:
+                            schema:
+                                type: string
+    /healthz:
+        get:
+            operationId: healthz
+            summary: Liveness probe
+            tags:
+                - system
+            responses:
+                "200":
+                    description: Gateway process is alive.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/HealthzResponse'
+                            example:
+                                ok: true
+    /metrics:
+        get:
+            operationId: metrics
+            summary: Prometheus metrics
+            tags:
+                - system
+            responses:
+                "200":
+                    description: Prometheus exposition format.
+                    content:
+                        text/plain:
+                            schema:
+                                type: string
+    /openapi.yaml:
+        get:
+            operationId: openapiYAML
+            summary: Generated OpenAPI YAML
+            tags:
+                - docs
+            responses:
+                "200":
+                    description: Live OpenAPI document for the gateway surface.
+                    content:
+                        application/yaml:
+                            schema:
+                                type: string
+                        text/yaml:
+                            schema:
+                                type: string
+    /readyz:
+        get:
+            operationId: readyz
+            summary: Readiness probe
+            tags:
+                - system
+            responses:
+                "200":
+                    description: Configuration is loaded and ready.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ReadyzResponse'
+                            example:
+                                ready: true
+                "503":
+                    description: Configuration has not been loaded yet.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    code: not_ready
+                                    message: configuration not loaded
+                                    type: server_error
+    /v1/chat/completions:
+        post:
+            operationId: chatCompletions
+            summary: Create a chat completion
+            description: Returns JSON for non-streaming requests and text/event-stream when stream=true.
+            tags:
+                - inference
+            security:
+                - bearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ChatCompletionsRequest'
+                        example:
+                            messages:
+                                - content: Say hello in one sentence.
+                                  role: user
+                            model: claude-sonnet
+            responses:
+                "200":
+                    description: Chat completion or SSE stream.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChatCompletionsResponse'
+                        text/event-stream:
+                            schema:
+                                type: string
+                            example: |+
+                                data: {"id":"evt_1"}
+
+                                data: [DONE]
+
+                    headers:
+                        Content-Type:
+                            schema:
+                                type: string
+                default:
+                    description: Error response.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    message: invalid request
+                                    type: invalid_request_error
+    /v1/completions:
+        post:
+            operationId: completions
+            summary: Create a legacy text completion
+            description: Thin compatibility route. It can bridge onto chat routes when the prompt shape is bridgeable.
+            tags:
+                - inference
+            security:
+                - bearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/CompletionsRequest'
+                        example:
+                            model: claude-sonnet
+                            prompt: Write one short sentence about Go.
+            responses:
+                "200":
+                    description: Legacy completion JSON or SSE stream.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CompletionsResponse'
+                        text/event-stream:
+                            schema:
+                                type: string
+                            example: |+
+                                data: {"id":"evt_1"}
+
+                                data: [DONE]
+
+                default:
+                    description: Error response.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    message: unsupported operation
+                                    type: invalid_request_error
+    /v1/embeddings:
+        post:
+            operationId: embeddings
+            summary: Create embeddings
+            tags:
+                - inference
+            security:
+                - bearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/EmbeddingsRequest'
+                        example:
+                            input: gateway
+                            model: claude-sonnet
+            responses:
+                "200":
+                    description: Embedding vectors.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/EmbeddingsResponse'
+                            example:
+                                data:
+                                    - embedding:
+                                        - 0.1
+                                        - 0.2
+                                      index: 0
+                                      object: embedding
+                                model: claude-sonnet
+                                object: list
+                                usage:
+                                    prompt_tokens: 1
+                                    total_tokens: 1
+                default:
+                    description: Error response.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    message: invalid request
+                                    type: invalid_request_error
+    /v1/models:
+        get:
+            operationId: listModels
+            summary: List configured model aliases
+            tags:
+                - system
+            responses:
+                "200":
+                    description: Configured public models.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ModelListResponse'
+                            example:
+                                data:
+                                    - id: claude-sonnet
+                                      object: model
+                                      owned_by: llmgw
+                                object: list
+                default:
+                    description: Error response.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    message: request failed
+                                    type: invalid_request_error
+    /v1/responses:
+        post:
+            operationId: responses
+            summary: Create a response
+            description: Uses native responses when a route supports them, otherwise bridges onto chat routes when features are bridgeable.
+            tags:
+                - inference
+            security:
+                - bearerAuth: []
+            requestBody:
+                required: true
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/ResponsesRequest'
+                        example:
+                            input: Summarize the gateway in one line.
+                            model: claude-sonnet
+            responses:
+                "200":
+                    description: Responses JSON or SSE stream.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ResponsesResponse'
+                        text/event-stream:
+                            schema:
+                                type: string
+                            example: |+
+                                event: response.created
+                                data: {"id":"evt_1"}
+
+                                data: [DONE]
+
+                default:
+                    description: Error response.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorEnvelope'
+                            example:
+                                error:
+                                    message: unsupported operation
+                                    type: invalid_request_error
+components:
+    schemas:
+        ChatChoice:
+            type: object
+            properties:
+                finish_reason:
+                    type: string
+                index:
+                    type: integer
+                message:
+                    $ref: '#/components/schemas/Message'
+        ChatCompletionsRequest:
+            type: object
+            properties:
+                max_output_tokens:
+                    type: integer
+                max_tokens:
+                    type: integer
+                messages:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Message'
+                metadata:
+                    type: object
+                    additionalProperties:
+                        type: string
+                model:
+                    type: string
+                    description: Configured model alias. The router resolves aliases to concrete provider routes.
+                    enum:
+                        - claude-sonnet
+                        - gpt-4o-mini
+                    example: claude-sonnet
+                reasoning:
+                    $ref: '#/components/schemas/Reasoning'
+                response_format:
+                    $ref: '#/components/schemas/ResponseFormat'
+                stream:
+                    type: boolean
+                    default: false
+                tool_choice:
+                    type: object
+                    additionalProperties: true
+                tools:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Tool'
+                user:
+                    type: string
+            required:
+                - model
+                - messages
+            additionalProperties: true
+        ChatCompletionsResponse:
+            type: object
+            properties:
+                choices:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/ChatChoice'
+                created:
+                    type: integer
+                    format: int64
+                id:
+                    type: string
+                model:
+                    type: string
+                object:
+                    type: string
+                    example: chat.completion
+                usage:
+                    $ref: '#/components/schemas/Usage'
+        CompletionChoice:
+            type: object
+            properties:
+                finish_reason:
+                    type: string
+                index:
+                    type: integer
+                text:
+                    type: string
+        CompletionsRequest:
+            type: object
+            properties:
+                max_tokens:
+                    type: integer
+                metadata:
+                    type: object
+                    additionalProperties:
+                        type: string
+                model:
+                    type: string
+                    description: Configured model alias. The router resolves aliases to concrete provider routes.
+                    enum:
+                        - claude-sonnet
+                        - gpt-4o-mini
+                    example: claude-sonnet
+                prompt:
+                    $ref: '#/components/schemas/TextInput'
+                stream:
+                    type: boolean
+                    default: false
+                suffix:
+                    type: string
+                user:
+                    type: string
+            required:
+                - model
+                - prompt
+            additionalProperties: true
+        CompletionsResponse:
+            type: object
+            properties:
+                choices:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/CompletionChoice'
+                created:
+                    type: integer
+                    format: int64
+                id:
+                    type: string
+                model:
+                    type: string
+                object:
+                    type: string
+                    example: text_completion
+                usage:
+                    $ref: '#/components/schemas/Usage'
+        ContentPart:
+            type: object
+            properties:
+                file_id:
+                    type: string
+                image_url:
+                    type: string
+                input_audio:
+                    $ref: '#/components/schemas/InputAudio'
+                input_text:
+                    type: string
+                mime_type:
+                    type: string
+                refusal:
+                    type: string
+                text:
+                    type: string
+                type:
+                    type: string
+                    example: text
+            additionalProperties: true
+        EmbeddingData:
+            type: object
+            properties:
+                embedding:
+                    type: array
+                    items:
+                        type: number
+                        format: double
+                index:
+                    type: integer
+                object:
+                    type: string
+                    example: embedding
+        EmbeddingsRequest:
+            type: object
+            properties:
+                dimensions:
+                    type: integer
+                encoding_format:
+                    type: string
+                input:
+                    $ref: '#/components/schemas/TextInput'
+                metadata:
+                    type: object
+                    additionalProperties:
+                        type: string
+                model:
+                    type: string
+                    description: Configured model alias. The router resolves aliases to concrete provider routes.
+                    enum:
+                        - claude-sonnet
+                        - gpt-4o-mini
+                    example: claude-sonnet
+                user:
+                    type: string
+            required:
+                - model
+                - input
+            additionalProperties: true
+        EmbeddingsResponse:
+            type: object
+            properties:
+                data:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/EmbeddingData'
+                model:
+                    type: string
+                object:
+                    type: string
+                    example: list
+                usage:
+                    $ref: '#/components/schemas/Usage'
+        ErrorEnvelope:
+            type: object
+            properties:
+                error:
+                    $ref: '#/components/schemas/ErrorObject'
+            required:
+                - error
+        ErrorObject:
+            type: object
+            properties:
+                code:
+                    type: string
+                message:
+                    type: string
+                param:
+                    type: string
+                type:
+                    type: string
+            required:
+                - message
+                - type
+        HealthzResponse:
+            type: object
+            properties:
+                ok:
+                    type: boolean
+        InputAudio:
+            type: object
+            properties:
+                data:
+                    type: string
+                format:
+                    type: string
+            additionalProperties: true
+        JSONSchema:
+            type: object
+            properties:
+                description:
+                    type: string
+                name:
+                    type: string
+                schema:
+                    type: object
+                    additionalProperties: true
+                strict:
+                    type: boolean
+            additionalProperties: true
+        Message:
+            type: object
+            properties:
+                content:
+                    oneOf:
+                        - type: string
+                        - $ref: '#/components/schemas/ContentPart'
+                        - type: array
+                          items:
+                            $ref: '#/components/schemas/ContentPart'
+                metadata:
+                    type: object
+                    additionalProperties:
+                        type: string
+                name:
+                    type: string
+                role:
+                    type: string
+                tool_call_id:
+                    type: string
+                tool_calls:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/ToolCall'
+            required:
+                - role
+            additionalProperties: true
+        Model:
+            type: object
+            properties:
+                id:
+                    type: string
+                object:
+                    type: string
+                    example: model
+                owned_by:
+                    type: string
+            required:
+                - id
+                - object
+                - owned_by
+        ModelListResponse:
+            type: object
+            properties:
+                data:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Model'
+                object:
+                    type: string
+                    example: list
+        ReadyzResponse:
+            type: object
+            properties:
+                ready:
+                    type: boolean
+        Reasoning:
+            type: object
+            properties:
+                effort:
+                    type: string
+                max_tokens:
+                    type: integer
+                summary:
+                    type: string
+            additionalProperties: true
+        ResponseFormat:
+            type: object
+            properties:
+                json_schema:
+                    $ref: '#/components/schemas/JSONSchema'
+                type:
+                    type: string
+            additionalProperties: true
+        ResponseOutput:
+            type: object
+            properties:
+                content:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/ContentPart'
+                id:
+                    type: string
+                role:
+                    type: string
+                type:
+                    type: string
+        ResponsesInput:
+            description: Accepts a string, a single message, a content-part array, or a full message array.
+            oneOf:
+                - type: string
+                - $ref: '#/components/schemas/Message'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/ContentPart'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/Message'
+        ResponsesRequest:
+            type: object
+            properties:
+                input:
+                    $ref: '#/components/schemas/ResponsesInput'
+                instructions:
+                    type: string
+                max_output_tokens:
+                    type: integer
+                metadata:
+                    type: object
+                    additionalProperties:
+                        type: string
+                model:
+                    type: string
+                    description: Configured model alias. The router resolves aliases to concrete provider routes.
+                    enum:
+                        - claude-sonnet
+                        - gpt-4o-mini
+                    example: claude-sonnet
+                reasoning:
+                    $ref: '#/components/schemas/Reasoning'
+                response_format:
+                    $ref: '#/components/schemas/ResponseFormat'
+                stream:
+                    type: boolean
+                    default: false
+                tool_choice:
+                    type: object
+                    additionalProperties: true
+                tools:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/Tool'
+                user:
+                    type: string
+            required:
+                - model
+                - input
+            additionalProperties: true
+        ResponsesResponse:
+            type: object
+            properties:
+                created:
+                    type: integer
+                    format: int64
+                id:
+                    type: string
+                model:
+                    type: string
+                object:
+                    type: string
+                    example: response
+                output:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/ResponseOutput'
+                output_text:
+                    type: string
+                status:
+                    type: string
+                usage:
+                    $ref: '#/components/schemas/Usage'
+        TextInput:
+            description: Accepts a single string, an array of strings, a token array, or a matrix of token arrays.
+            oneOf:
+                - type: string
+                - type: array
+                  items:
+                    type: string
+                - type: array
+                  items:
+                    type: integer
+                - type: array
+                  items:
+                    type: array
+                    items:
+                        type: integer
+        Tool:
+            type: object
+            properties:
+                description:
+                    type: string
+                function:
+                    type: object
+                    additionalProperties: true
+                name:
+                    type: string
+                parameters:
+                    type: object
+                    additionalProperties: true
+                strict:
+                    type: boolean
+                type:
+                    type: string
+                    example: function
+            additionalProperties: true
+        ToolCall:
+            type: object
+            properties:
+                arguments:
+                    type: string
+                function:
+                    type: object
+                    additionalProperties: true
+                id:
+                    type: string
+                name:
+                    type: string
+                type:
+                    type: string
+            additionalProperties: true
+        Usage:
+            type: object
+            properties:
+                completion_tokens:
+                    type: integer
+                    format: int64
+                prompt_tokens:
+                    type: integer
+                    format: int64
+                total_tokens:
+                    type: integer
+                    format: int64
+    securitySchemes:
+        bearerAuth:
+            type: http
+            scheme: bearer
+            bearerFormat: API key
+            description: 'Send Authorization: Bearer <token> when auth is enabled.'

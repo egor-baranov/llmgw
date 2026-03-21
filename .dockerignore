@@ -1,0 +1,6 @@
+.git
+.gitignore
+.idea
+.DS_Store
+bin
+openapi.yaml

@@ -1,0 +1,21 @@
+services:
+  llmgw:
+    build:
+      context: .
+    image: llmgw:local
+    command: ["-config", "/etc/llmgw/config.example.yaml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/config.example.yaml:/etc/llmgw/config.example.yaml:ro
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

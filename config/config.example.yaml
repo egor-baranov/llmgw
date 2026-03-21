@@ -1,0 +1,193 @@
+server:
+  listen: ":8080"
+  read_timeout: 15s
+  write_timeout: 0s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+
+auth:
+  require_user: false
+  require_project: false
+  max_body_bytes: 4194304
+  tokens:
+    local-dev-token:
+      id: dev
+      name: local-dev
+      key_id: dev-key
+      quota_key: dev
+      providers: [openai, anthropic, gemini]
+      models: [gpt-4o-mini, claude-3-7-sonnet-latest, gemini-2.5-flash]
+  # jwt:
+  #   algorithm: HS256
+  #   issuer: llmgw
+  #   audience: gateway
+  #   secret_env: LLMGW_JWT_SECRET
+  #   claims:
+  #     principal: sub
+  #     key_id: key_id
+
+store:
+  mode: memory
+  # postgres_dsn_env: LLMGW_POSTGRES_DSN
+  # quota_table: quota_limits
+  limit_cache_ttl: 30s
+  reservation_ttl: 10m
+
+telemetry:
+  service_name: llmgw
+
+quota:
+  profiles:
+    dev-token:
+      max_parallel: 32
+      max_spend_micros: 5000000
+      daily_tokens: 1000000
+  keys:
+    dev-key: dev-token
+
+routes:
+  openai-primary:
+    provider: openai
+    model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    priority: 100
+    weight: 100
+    timeout: 30s
+    limits:
+      rpm: 3000
+      tpm: 2000000
+      concurrency: 256
+      provider_concurrency: 256
+      max_body_bytes: 4194304
+    circuit:
+      failures: 3
+      cooldown: 30s
+    capabilities:
+      operations: [chat.completions, responses, completions, embeddings]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: true
+      audio: false
+      reasoning: true
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      tokenizer: o200k_base
+    pricing:
+      input_per_1m: 0.15
+      output_per_1m: 0.60
+
+  anthropic-fallback:
+    provider: anthropic
+    model: claude-3-7-sonnet-latest
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+    priority: 90
+    weight: 100
+    timeout: 30s
+    headers:
+      anthropic-version: "2023-06-01"
+    limits:
+      rpm: 2000
+      tpm: 1000000
+      concurrency: 128
+      provider_concurrency: 128
+    circuit:
+      failures: 3
+      cooldown: 30s
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: false
+      audio: false
+      reasoning: true
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      tokenizer: claude
+
+  anthropic-primary:
+    provider: anthropic
+    model: claude-3-7-sonnet-latest
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+    priority: 100
+    weight: 100
+    timeout: 30s
+    headers:
+      anthropic-version: "2023-06-01"
+    limits:
+      rpm: 2000
+      tpm: 1000000
+      concurrency: 128
+      provider_concurrency: 128
+    circuit:
+      failures: 3
+      cooldown: 30s
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: false
+      audio: false
+      reasoning: true
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      tokenizer: claude
+
+  gemini-primary:
+    provider: gemini
+    backend: gemini
+    model: gemini-2.5-flash
+    base_url: https://generativelanguage.googleapis.com
+    api_key_env: GEMINI_API_KEY
+    api_version: v1beta
+    priority: 100
+    weight: 100
+    timeout: 30s
+    limits:
+      rpm: 2000
+      tpm: 1000000
+      concurrency: 128
+      provider_concurrency: 128
+    circuit:
+      failures: 3
+      cooldown: 30s
+    capabilities:
+      operations: [chat.completions, embeddings]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: true
+      audio: true
+      reasoning: true
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      tokenizer: gemini
+    pricing:
+      input_per_1m: 0.30
+      output_per_1m: 2.50
+
+# Example OpenAI-compatible third-party route:
+#   ollama-local:
+#     provider: openai
+#     model: llama3.1:8b
+#     base_url: http://localhost:11434/v1
+#     api_key_env: OPENAI_COMPAT_API_KEY
+#     priority: 80
+#     weight: 100
+#     timeout: 30s
+#     capabilities:
+#       operations: [chat.completions, responses, completions, embeddings]
+#       streaming: true
+#       tool_calling: true
+#       structured_output: true
+#       vision_input: false
+#       audio: false
+#       reasoning: false
+#       max_input_tokens: 32768
+#       max_output_tokens: 4096
+#       tokenizer: cl100k_base
