@@ -1,6 +1,6 @@
 # llmgw
 
-Compact, production-lean LLM gateway in Go.
+Proxy-first LLM gateway in Go for routing, limits, and quota enforcement.
 
 ### API
 
