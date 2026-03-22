@@ -67,11 +67,45 @@ docker run --rm -p 8080:8080 \
   llmgw:local
 ```
 
+## Deploy To Nebius (GitHub Actions)
+
+This repo includes [`.github/workflows/deploy-nebius.yml`](.github/workflows/deploy-nebius.yml).
+
+Required GitHub repository secrets:
+- `NB_PROJECT_ID`
+- `NB_SUBNET_ID`
+- `NB_SERVICE_ACCOUNT_ID`
+- `NB_PUBLIC_KEY_ID`
+- `NB_PRIVATE_KEY_PEM`
+
+Optional secrets:
+- `NB_ENDPOINT_AUTH_TOKEN`
+- `NB_REGISTRY_USERNAME`
+- `NB_REGISTRY_PASSWORD`
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `GEMINI_API_KEY`
+- `LLMGW_JWT_SECRET`
+- `LLMGW_POSTGRES_DSN`
+- `LLMGW_REDIS_ADDR`
+- `LLMGW_REDIS_PASSWORD`
+- `LLMGW_BEARER_TOKEN`
+
+Optional repository variables:
+- `NB_ENDPOINT_NAME` (default: `llmgw`)
+- `NB_PLATFORM` (default: `cpu-d3`)
+- `NB_PRESET` (default: `4vcpu-16gb`)
+- `NB_CONTAINER_PORT` (default: `8080`)
+
+The workflow builds and pushes a Docker image to GHCR, then recreates the Nebius endpoint with the new image.
+
 Generate the OpenAPI YAML without starting the server:
 
 ```bash
 go run ./cmd/llmgw -config config/config.example.yaml -print-openapi > openapi.yaml
 ```
+
+The checked-in [`openapi.yaml`](/openapi.yaml) is a convenience snapshot. The live source of truth is generated from the running config and served at `/openapi.yaml`.
 
 Reload config in place:
 

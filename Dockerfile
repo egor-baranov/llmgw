@@ -15,9 +15,10 @@ RUN apk add --no-cache ca-certificates wget
 
 WORKDIR /app
 
-COPY --from=build /out/llmgw /usr/local/bin/llmgw
-
 RUN mkdir -p /etc/llmgw
+
+COPY --from=build /out/llmgw /usr/local/bin/llmgw
+COPY config/config.example.yaml /etc/llmgw/config.yaml
 
 EXPOSE 8080
 

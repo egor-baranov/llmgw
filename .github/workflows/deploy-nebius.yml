@@ -1,0 +1,152 @@
+name: Deploy To Nebius
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/llmgw
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      NB_PROJECT_ID: ${{ secrets.NB_PROJECT_ID }}
+      NB_SUBNET_ID: ${{ secrets.NB_SUBNET_ID }}
+      NB_SERVICE_ACCOUNT_ID: ${{ secrets.NB_SERVICE_ACCOUNT_ID }}
+      NB_PUBLIC_KEY_ID: ${{ secrets.NB_PUBLIC_KEY_ID }}
+      NB_PRIVATE_KEY_PEM: ${{ secrets.NB_PRIVATE_KEY_PEM }}
+      NB_ENDPOINT_NAME: ${{ vars.NB_ENDPOINT_NAME }}
+      NB_PLATFORM: ${{ vars.NB_PLATFORM }}
+      NB_PRESET: ${{ vars.NB_PRESET }}
+      NB_CONTAINER_PORT: ${{ vars.NB_CONTAINER_PORT }}
+      NB_ENDPOINT_AUTH_TOKEN: ${{ secrets.NB_ENDPOINT_AUTH_TOKEN }}
+      NB_REGISTRY_USERNAME: ${{ secrets.NB_REGISTRY_USERNAME }}
+      NB_REGISTRY_PASSWORD: ${{ secrets.NB_REGISTRY_PASSWORD }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      LLMGW_JWT_SECRET: ${{ secrets.LLMGW_JWT_SECRET }}
+      LLMGW_POSTGRES_DSN: ${{ secrets.LLMGW_POSTGRES_DSN }}
+      LLMGW_REDIS_ADDR: ${{ secrets.LLMGW_REDIS_ADDR }}
+      LLMGW_REDIS_PASSWORD: ${{ secrets.LLMGW_REDIS_PASSWORD }}
+      LLMGW_BEARER_TOKEN: ${{ secrets.LLMGW_BEARER_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install Nebius CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh | bash
+          echo "$HOME/.nebius/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          nebius version
+
+      - name: Configure Nebius CLI profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${NB_PROJECT_ID}"
+          test -n "${NB_SUBNET_ID}"
+          test -n "${NB_SERVICE_ACCOUNT_ID}"
+          test -n "${NB_PUBLIC_KEY_ID}"
+          test -n "${NB_PRIVATE_KEY_PEM}"
+
+          PROFILE_NAME="ci-${GITHUB_RUN_ID}"
+          KEY_PATH="$RUNNER_TEMP/nebius_sa.pem"
+          printf '%s' "$NB_PRIVATE_KEY_PEM" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          nebius profile create \
+            --profile "$PROFILE_NAME" \
+            --endpoint api.nebius.cloud \
+            --service-account-id "$NB_SERVICE_ACCOUNT_ID" \
+            --public-key-id "$NB_PUBLIC_KEY_ID" \
+            --private-key-file "$KEY_PATH" \
+            --parent-id "$NB_PROJECT_ID"
+
+      - name: Deploy endpoint
+        shell: bash
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          endpoint_name="${NB_ENDPOINT_NAME:-llmgw}"
+          platform="${NB_PLATFORM:-cpu-d3}"
+          preset="${NB_PRESET:-4vcpu-16gb}"
+          container_port="${NB_CONTAINER_PORT:-8080}"
+
+          set +e
+          endpoint_id="$(nebius ai endpoint get-by-name --name "$endpoint_name" --parent-id "$NB_PROJECT_ID" --format jsonpath='{.metadata.id}' 2>/dev/null)"
+          get_status=$?
+          set -e
+
+          if [[ $get_status -eq 0 && -n "$endpoint_id" ]]; then
+            nebius ai endpoint delete --id "$endpoint_id"
+          fi
+
+          create_args=(
+            ai endpoint create
+            --name "$endpoint_name"
+            --parent-id "$NB_PROJECT_ID"
+            --image "$IMAGE_REF"
+            --platform "$platform"
+            --preset "$preset"
+            --public
+            --container-port "$container_port"
+            --subnet-id "$NB_SUBNET_ID"
+          )
+
+          if [[ -n "${NB_ENDPOINT_AUTH_TOKEN:-}" ]]; then
+            create_args+=(--auth token --token "$NB_ENDPOINT_AUTH_TOKEN")
+          fi
+
+          if [[ -n "${NB_REGISTRY_USERNAME:-}" && -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
+            create_args+=(--registry-username "$NB_REGISTRY_USERNAME" --registry-password "$NB_REGISTRY_PASSWORD")
+          fi
+
+          for key in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY LLMGW_JWT_SECRET LLMGW_POSTGRES_DSN LLMGW_REDIS_ADDR LLMGW_REDIS_PASSWORD LLMGW_BEARER_TOKEN; do
+            value="${!key:-}"
+            if [[ -n "$value" ]]; then
+              create_args+=(--env "${key}=${value}")
+            fi
+          done
+
+          nebius "${create_args[@]}"
