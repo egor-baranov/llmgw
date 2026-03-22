@@ -57,7 +57,7 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=sha
+            type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
@@ -107,7 +107,7 @@ jobs:
       - name: Deploy endpoint
         shell: bash
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          IMAGE_REF: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
         run: |
           set -euo pipefail
           NEBIUS_BIN="$HOME/.nebius/bin/nebius"
