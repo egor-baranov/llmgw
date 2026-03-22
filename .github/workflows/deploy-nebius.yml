@@ -74,14 +74,17 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh | bash
+          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
+          test -x "$NEBIUS_BIN"
           echo "$HOME/.nebius/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          nebius version
+          "$NEBIUS_BIN" version --full
 
       - name: Configure Nebius CLI profile
         shell: bash
         run: |
           set -euo pipefail
+          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
           test -n "${NB_PROJECT_ID}"
           test -n "${NB_SUBNET_ID}"
           test -n "${NB_SERVICE_ACCOUNT_ID}"
@@ -93,7 +96,7 @@ jobs:
           printf '%s' "$NB_PRIVATE_KEY_PEM" > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
 
-          nebius profile create \
+          "$NEBIUS_BIN" profile create \
             --profile "$PROFILE_NAME" \
             --endpoint api.nebius.cloud \
             --service-account-id "$NB_SERVICE_ACCOUNT_ID" \
@@ -107,6 +110,7 @@ jobs:
           IMAGE_REF: ${{ env.IMAGE_NAME }}:${{ github.sha }}
         run: |
           set -euo pipefail
+          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
 
           endpoint_name="${NB_ENDPOINT_NAME:-llmgw}"
           platform="${NB_PLATFORM:-cpu-d3}"
@@ -114,12 +118,12 @@ jobs:
           container_port="${NB_CONTAINER_PORT:-8080}"
 
           set +e
-          endpoint_id="$(nebius ai endpoint get-by-name --name "$endpoint_name" --parent-id "$NB_PROJECT_ID" --format jsonpath='{.metadata.id}' 2>/dev/null)"
+          endpoint_id="$("$NEBIUS_BIN" ai endpoint get-by-name --name "$endpoint_name" --parent-id "$NB_PROJECT_ID" --format jsonpath='{.metadata.id}' 2>/dev/null)"
           get_status=$?
           set -e
 
           if [[ $get_status -eq 0 && -n "$endpoint_id" ]]; then
-            nebius ai endpoint delete --id "$endpoint_id"
+            "$NEBIUS_BIN" ai endpoint delete --id "$endpoint_id"
           fi
 
           create_args=(
@@ -149,4 +153,4 @@ jobs:
             fi
           done
 
-          nebius "${create_args[@]}"
+          "$NEBIUS_BIN" "${create_args[@]}"
