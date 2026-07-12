@@ -1,0 +1,62 @@
+server:
+  listen: ":0"
+
+auth:
+  require_user: true
+  require_project: true
+  max_body_bytes: 1048576
+  tokens:
+    benchmark-token:
+      id: benchmark
+      key_id: benchmark-key
+      providers: [openai]
+      models: [benchmark-model]
+      projects: [benchmark-project]
+
+store:
+  mode: memory
+  reservation_ttl: 10m
+
+telemetry:
+  service_name: llmgw-benchmark
+
+quota:
+  profiles:
+    benchmark-enforced:
+      rpm: 100000000
+      tpm: 100000000000
+      max_parallel: 100000
+      max_spend_micros: 100000000000
+      daily_tokens: 100000000000
+      monthly_tokens: 100000000000
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      model_allowlist: [benchmark-model]
+      provider_allowlist: [openai]
+  keys:
+    benchmark-key: benchmark-enforced
+
+routes:
+  benchmark-route:
+    provider: openai
+    model: benchmark-model
+    base_url: http://benchmark.invalid/v1
+    timeout: 30s
+    limits:
+      rpm: 100000000
+      tpm: 100000000000
+      concurrency: 100000
+      provider_concurrency: 100000
+      max_body_bytes: 1048576
+    capabilities:
+      operations: [chat.completions, responses, completions, embeddings]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      reasoning: true
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      tokenizer: o200k_base
+    pricing:
+      input_per_1m: 1.0
+      output_per_1m: 1.0

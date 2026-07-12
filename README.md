@@ -113,6 +113,21 @@ Reload config in place:
 pkill -HUP -f llmgw
 ```
 
+## Performance benchmark
+
+Run the loopback HTTP benchmark for the main endpoints:
+
+```bash
+go test ./test/performance \
+  -run '^$' \
+  -bench '^BenchmarkHTTP$' \
+  -benchmem \
+  -benchtime=5s \
+  -count=3
+```
+
+The benchmark exercises the real HTTP ingress and the production-style in-memory auth, required user/project checks, token validation, key-scoped quota reservation, RPM/TPM, route/provider concurrency, ACL, routing, metrics, response, and settlement path. Limit ceilings are deliberately high enough to execute enforcement without throttling valid benchmark traffic. An in-process provider stub returns a fixed successful response immediately, so the result measures gateway throughput without external provider or network latency. The load generator and gateway share the same Go process and CPU allocation; use `-cpu=1,4,8` to compare scaling. JSON logs are formatted but written to `io.Discard`, keeping terminal or disk speed out of the measurement.
+
 ## Curl
 
 List models:
