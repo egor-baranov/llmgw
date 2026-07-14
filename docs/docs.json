@@ -1,0 +1,129 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "llmgw",
+  "description": "Documentation for the llmgw OpenAI-compatible LLM gateway",
+  "colors": {
+    "primary": "#115E59",
+    "light": "#14B8A6",
+    "dark": "#0D9488"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "icon": "book-open",
+        "groups": [
+          {
+            "group": "Getting started",
+            "icon": "rocket",
+            "pages": [
+              "index",
+              "getting-started/quickstart",
+              "getting-started/docker"
+            ]
+          },
+          {
+            "group": "Usage guides",
+            "icon": "route",
+            "pages": [
+              "guides/configuration",
+              "guides/authentication",
+              "guides/providers",
+              "guides/streaming",
+              "guides/limits-and-quotas",
+              "guides/operations",
+              "guides/troubleshooting"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "icon": "diagram-project",
+            "pages": [
+              "concepts/architecture",
+              "concepts/request-lifecycle",
+              "concepts/routing-and-streaming",
+              "concepts/provider-registry"
+            ]
+          },
+          {
+            "group": "Configuration reference",
+            "icon": "sliders",
+            "pages": [
+              "configuration/overview",
+              "configuration/server",
+              "configuration/authentication",
+              "configuration/routes",
+              "configuration/capabilities-and-pricing",
+              "configuration/quotas-and-limits",
+              "configuration/storage",
+              "configuration/telemetry",
+              "configuration/environment-variables",
+              "configuration/reload-and-validation",
+              "configuration/security"
+            ]
+          },
+          {
+            "group": "Operations",
+            "icon": "server",
+            "pages": [
+              "operations/observability",
+              "operations/reliability",
+              "operations/deployment"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "icon": "square-terminal",
+        "groups": [
+          {
+            "group": "Using the API",
+            "pages": [
+              "api-reference/overview",
+              "api-reference/openai",
+              "api-reference/anthropic",
+              "api-reference/gemini",
+              "api-reference/management"
+            ]
+          },
+          {
+            "group": "Interactive endpoints",
+            "openapi": {
+              "source": "openapi.yaml",
+              "directory": "api-reference/endpoints"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "api": {
+    "playground": {
+      "display": "simple"
+    },
+    "examples": {
+      "languages": [
+        "curl",
+        "python",
+        "javascript",
+        "go"
+      ],
+      "defaults": "required",
+      "prefill": true,
+      "autogenerate": true
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/egor-baranov/llmgw"
+      }
+    ]
+  }
+}

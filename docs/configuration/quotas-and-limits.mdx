@@ -1,0 +1,191 @@
+---
+title: Quotas and limits
+description: Configure key-scoped governance, static profiles, dynamic overrides, reservations, and usage reporting.
+---
+
+llmgw has two complementary limit layers:
+
+- **Route attempt limits** (`routes.<name>.limits`) protect upstream capacity and apply to every real provider call, including retries.
+- **Key quota limits** (`quota` or the dynamic limit store) govern an authenticated client across its request lifecycle.
+
+This page covers key quotas. See [Routes](/configuration/routes#attempt-controls) for route RPM, TPM, concurrency, and byte caps.
+
+## Static quota profiles
+
+Define reusable profiles and assign authenticated key IDs to them:
+
+```yaml
+quota:
+  profiles:
+    standard:
+      rpm: 120
+      tpm: 200000
+      max_parallel: 16
+      daily_tokens: 2000000
+      monthly_tokens: 40000000
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      model_allowlist: [fast-chat, embeddings]
+      provider_allowlist: [openai, anthropic]
+  keys:
+    service-a-prod: standard
+```
+
+The assignment key must match the principal’s effective quota key—normally `auth.*.<principal>.key_id` or the configured JWT `key_id` claim. Every `quota.keys` value must reference an existing profile.
+
+An authenticated key with no static assignment and no dynamic record has no key quota. Route-level controls still apply.
+
+## Limit fields
+
+| Field | Type | Zero means | Enforcement |
+| --- | --- | --- | --- |
+| `rpm` | integer | disabled | Requests admitted during the current UTC minute. One client request consumes one unit even when it later retries. |
+| `tpm` | integer | disabled | Estimated/actual tokens during the current UTC minute. Tokens are reserved before upstream calls and reconciled afterward. |
+| `max_parallel` | integer | disabled | Active client requests for this key. |
+| `max_spend_micros` | integer | disabled | Hard spend ceiling for the current `budget_duration` bucket. Used plus held spend must remain within it. |
+| `soft_spend_micros` | integer | disabled | Warning threshold. It emits a log and metric but does not reject the request. |
+| `daily_tokens` | integer | disabled | Used plus held tokens in the current UTC calendar day. |
+| `monthly_tokens` | integer | disabled | Used plus held tokens in the current UTC calendar month. |
+| `budget_duration` | duration | lifetime bucket | Fixed UTC-aligned spend-bucket length. Examples: `24h`, `720h`. It applies to spend limits, not daily/monthly token fields. |
+| `max_input_tokens` | integer | disabled | Removes route candidates whose input estimate exceeds the key maximum. |
+| `max_output_tokens` | integer | disabled | Removes candidates when the effective requested output maximum exceeds the key maximum. |
+| `model_allowlist` | string array | unrestricted | Public model aliases this key may use. |
+| `provider_allowlist` | string array | unrestricted | Provider adapters this key may use. Providers must have at least one configured route. |
+
+All numeric limits and `budget_duration` must be non-negative. Accounting values may not exceed `99,999,999,999,999`, which keeps Redis-backed integer accounting exact through Lua/CJSON. If both spend thresholds are set, `soft_spend_micros` may not exceed `max_spend_micros`.
+
+<Warning>
+  With `max_spend_micros` enabled and `budget_duration: 0s` or omitted, the spend bucket is named `forever` and does not expire naturally. Configure an explicit duration if the budget should reset.
+</Warning>
+
+Fixed durations are aligned to the Unix epoch in UTC, not to a key’s creation time. For calendar billing, `monthly_tokens` resets at the start of a UTC calendar month; a `budget_duration` such as `720h` is a fixed 30-day window, not a calendar month.
+
+## Reservation and settlement
+
+Quota accounting follows an estimate → reserve → commit/refund lifecycle:
+
+<Steps>
+  <Step title="Resolve one key scope">
+    llmgw uses the authenticated principal’s effective key ID. A dynamic record takes precedence over its static profile.
+  </Step>
+  <Step title="Admit the request">
+    The store atomically checks/increments key RPM and active requests, creating an idempotent reservation ticket.
+  </Step>
+  <Step title="Authorize each real provider call">
+    Immediately before an attempt, llmgw reserves that route’s estimated input, worst-case output, and spend. Retries and fallbacks are separate provider invocations.
+  </Step>
+  <Step title="Reconcile attempts">
+    Provider-reported usage replaces estimates where available. Missing or partial stream dimensions remain conservative. Unused attempt credit can be reused by a fallback.
+  </Step>
+  <Step title="Settle the request">
+    Successful/billable usage is committed. A request that never becomes billable is refunded. Reservations are renewed while active and expire if settlement cannot occur.
+  </Step>
+</Steps>
+
+`store.reservation_ttl` is the requested lease lifetime. At runtime, llmgw raises it when necessary to cover all candidate timeouts and retries plus a settlement buffer, so a valid long request does not begin with an obviously short ticket.
+
+## Spend accounting
+
+Spend is an integer number of micro-units calculated from the selected route’s pricing. Reservations use estimated input, worst-case output, cache behavior, and bounded hosted-tool units; settlement uses provider-reported usage when available.
+
+For hard spend enforcement, configure complete pricing on every eligible route. See [Capabilities and pricing](/configuration/capabilities-and-pricing#pricing-fields).
+
+`soft_spend_micros` checks projected used + held + newly reserved spend. Exceeding it:
+
+- does not reject the request;
+- logs `quota soft spend threshold exceeded`; and
+- increments `llmgw_quota_soft_spend_exceeded_total`.
+
+## Dynamic limits API
+
+`GET /v1/limits` returns the authenticated key’s effective limit and, when supported by the hot-path quota store, current usage.
+
+```bash
+curl http://127.0.0.1:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_CLIENT_TOKEN"
+```
+
+Example response:
+
+```json
+{
+  "key_id": "service-a-prod",
+  "source": "config",
+  "limits": {
+    "rpm": 120,
+    "tpm": 200000,
+    "max_parallel": 16
+  },
+  "usage": {
+    "active_requests": 1,
+    "rpm_current": 4,
+    "tpm_current": 32768
+  }
+}
+```
+
+`source` is `config` for a static profile and `dynamic` when the dynamic limit store contains the key.
+
+### Update the authenticated key
+
+`PUT /v1/limits` replaces the entire dynamic limit object for the caller’s own effective key ID. It requires `manage_limits`.
+
+```bash
+curl -X PUT http://127.0.0.1:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_LIMIT_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "rpm": 240,
+    "tpm": 500000,
+    "max_parallel": 32,
+    "budget_duration": "24h",
+    "max_spend_micros": 5000000,
+    "provider_allowlist": ["openai"]
+  }'
+```
+
+The JSON decoder rejects unknown fields, trailing documents, invalid durations, negative values, and providers with no configured route. The global `auth.max_body_bytes` cap applies.
+
+<Note>
+  There is no administrator path parameter in this endpoint. A caller with `manage_limits` updates only the key ID resolved from its own credential. Use a distinct administrative credential for a key if self-service mutation is not appropriate.
+</Note>
+
+### Dynamic precedence and durability
+
+When a dynamic record exists, it **fully replaces** the static profile; fields are not merged. Omitting a field in `PUT` sets it to its zero/unrestricted meaning.
+
+The current API has no delete operation for a dynamic record. Writing an all-zero object still leaves a dynamic override in place, so it does not reveal the static profile again. Remove the row directly through the durable control plane, or restart an instance that has no PostgreSQL limit store; other PostgreSQL-backed instances observe a direct deletion on snapshot refresh.
+
+| Limit store | Dynamic update behavior |
+| --- | --- |
+| Memory (no PostgreSQL DSN) | Available immediately but process-local and lost on restart. In a multi-instance deployment, each instance has a different map. |
+| PostgreSQL configured | Upserted durably and immediately published into that instance’s immutable in-memory snapshot. Other instances receive it on their next background refresh. |
+
+Redis does not persist limit definitions. It stores shared quota reservations, counters, and usage. Configure PostgreSQL when dynamic definitions must survive restarts or converge across instances; see [Storage](/configuration/storage).
+
+## Usage response fields
+
+| Field | Meaning |
+| --- | --- |
+| `active_requests` | Current held key request slots. |
+| `rpm_current` | Requests in the active UTC minute bucket. |
+| `tpm_current` | Reserved/reconciled tokens in the active UTC minute bucket. |
+| `spend_used_micros` | Committed spend in the active spend bucket. |
+| `spend_held_micros` | Spend reserved by in-flight requests. |
+| `daily_used_tokens` / `daily_held_tokens` | Committed and held tokens in the current UTC day. |
+| `monthly_used_tokens` / `monthly_held_tokens` | Committed and held tokens in the current UTC month. |
+
+The response omits zero-valued usage fields. If usage retrieval fails after the limit itself was resolved, the endpoint still returns the limits with `usage_unavailable: true`.
+
+## Static versus route limits
+
+| Concern | Route setting | Key quota setting |
+| --- | --- | --- |
+| Protect one upstream route | `routes.*.limits.rpm/tpm/concurrency` | — |
+| Cap all routes for one provider | `routes.*.limits.provider_concurrency` | `provider_allowlist` controls access, not capacity |
+| Govern one client across fallbacks | — | `rpm`, `tpm`, `max_parallel`, spend/day/month fields |
+| Bound request/response bytes | `limits.max_body_bytes`, `limits.max_response_bytes` | — |
+| Restrict model/provider access | Principal ACL and/or quota allowlists | `model_allowlist`, `provider_allowlist` |
+| Restrict per-request token size | Route capability maxima | `max_input_tokens`, `max_output_tokens` |
+
+Use both layers in production: route limits protect upstream services, while key quotas enforce customer or workload policy.

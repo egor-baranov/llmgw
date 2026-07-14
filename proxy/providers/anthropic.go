@@ -19,8 +19,15 @@ func AnthropicRequest(r *http.Request, maxBytes int64) (*gateway.Request, error)
 		MaxOutputPaths: [][]string{
 			{"max_tokens"},
 		},
+		RequiredArrayPaths:   [][]string{{"messages"}},
+		PositiveIntegerPaths: [][]string{{"max_tokens"}},
 		MetadataPaths: [][]string{
 			{"metadata"},
 		},
+		UserPaths: [][]string{
+			{"metadata", "user_id"},
+		},
+		DetectProviderUnits:    anthropicProviderUnits,
+		DetectPromptCacheWrite: anthropicPromptCacheWrite,
 	})
 }

@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LLMGW_TEST_REDIS_URL: redis://localhost:6379/15
+    services:
+      redis:
+        image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up current Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.5
+          cache: true
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Redis integration tests
+        run: go test -tags=integration ./store -run '^TestRedisRealServerIntegration$' -count=1
+
+      - name: Race tests
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Formatting and module consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)"
+          go mod tidy -diff
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" HEAD --
+
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  minimum-go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up minimum Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.24.13
+          cache: true
+
+      - name: Compatibility tests
+        run: go test ./...
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install documentation dependencies
+        run: npm ci
+
+      - name: Validate documentation
+        run: npm run validate
+
+      - name: Check documentation links
+        run: npm run broken-links
+
+      - name: Check documentation accessibility
+        run: npm run a11y
+
+      - name: Audit documentation dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Verify generated OpenAPI documentation is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run sync:openapi
+          git diff --exit-code -- openapi.yaml
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Validate Compose configuration
+        env:
+          LLMGW_BEARER_TOKEN: ci-placeholder
+          OPENAI_API_KEY: ci-placeholder
+          ANTHROPIC_API_KEY: ci-placeholder
+          GEMINI_API_KEY: ci-placeholder
+        run: docker compose config --quiet
+
+      - name: Check and build the production image
+        run: |
+          docker buildx build --check --file Dockerfile .
+          docker buildx build --load --tag llmgw:ci --file Dockerfile .
+
+      - name: Smoke-test the non-root production image
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=llmgw-ci-smoke
+          cleanup() {
+            exit_code=$?
+            trap - EXIT
+            if [ "$exit_code" -ne 0 ]; then
+              docker logs "$container" || true
+            fi
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            exit "$exit_code"
+          }
+          trap cleanup EXIT
+          docker run --detach --name "$container" --publish 127.0.0.1:18080:8080 \
+            --env LLMGW_BEARER_TOKEN=ci-placeholder \
+            --env OPENAI_API_KEY=ci-placeholder \
+            --env ANTHROPIC_API_KEY=ci-placeholder \
+            --env GEMINI_API_KEY=ci-placeholder \
+            llmgw:ci
+          test "$(docker inspect --format '{{.Config.User}}' "$container")" = llmgw
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null && \
+               curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null && \
+               curl --fail --silent \
+                 --header 'Authorization: Bearer ci-placeholder' \
+                 http://127.0.0.1:18080/v1/models >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "llmgw container did not become healthy" >&2
+          exit 1

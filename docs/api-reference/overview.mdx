@@ -1,0 +1,134 @@
+---
+title: "API overview"
+description: "Base URL, authentication, common headers, errors, and the complete llmgw HTTP surface."
+---
+
+The default local base URL is:
+
+```text
+http://localhost:8080
+```
+
+Generated endpoint pages use this address for copyable request examples. The Mintlify playground is intentionally in simple mode: it does not relay gateway credentials through a hosted proxy or attempt a cross-origin browser request to the local service.
+
+Inference requests use provider-native paths and response envelopes. Send JSON request bodies with `Content-Type: application/json`; streaming responses use `text/event-stream`.
+
+## Authentication
+
+```http
+Authorization: Bearer <gateway-token>
+```
+
+Bearer authentication works on all protected endpoints. Provider-native inference additionally accepts:
+
+- Anthropic: `x-api-key: <gateway-token>`
+- Gemini: `x-goog-api-key: <gateway-token>`
+
+These are llmgw credentials, not upstream API keys. Route configuration supplies upstream credentials.
+
+`/healthz` and `/readyz` are always public. With `auth.allow_anonymous: false`, all inference/discovery/limit endpoints require an authenticated principal; `/metrics`, generated OpenAPI, and Swagger UI additionally require `view_operations`. The limits API always requires bearer authentication, even when anonymous inference is enabled.
+
+## Complete endpoint list
+
+| Method | Path | Protocol / purpose |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | OpenAI chat completions, unary or SSE |
+| `POST` | `/v1/responses` | OpenAI Responses, unary or native SSE |
+| `POST` | `/v1/completions` | OpenAI legacy completions, unary or SSE |
+| `POST` | `/v1/embeddings` | OpenAI embeddings |
+| `POST` | `/v1/messages` | Anthropic Messages, unary or SSE |
+| `POST` | `/v1beta/models/{model}:generateContent` | Gemini v1beta generation |
+| `POST` | `/v1beta/models/{model}:streamGenerateContent` | Gemini v1beta SSE generation |
+| `POST` | `/v1beta/models/{model}:embedContent` | Gemini v1beta embedding |
+| `POST` | `/v1/models/{model}:generateContent` | Gemini v1 generation |
+| `POST` | `/v1/models/{model}:streamGenerateContent` | Gemini v1 SSE generation |
+| `POST` | `/v1/models/{model}:embedContent` | Gemini v1 embedding |
+| `GET` | `/v1/models` | Models visible to the authenticated principal |
+| `GET` | `/v1/limits` | Effective limits and current usage for the caller's key |
+| `PUT` | `/v1/limits` | Replace the caller's dynamic limits; needs `manage_limits` |
+| `GET` | `/healthz` | Public liveness probe |
+| `GET` | `/readyz` | Public readiness/dependency probe |
+| `GET` | `/metrics` | Protected Prometheus metrics |
+| `GET` | `/openapi.json` | Protected live OpenAPI JSON |
+| `GET` | `/openapi.yaml` | Protected live OpenAPI YAML |
+| `GET` | `/docs` and `/docs/*` | Protected Swagger UI and its assets |
+
+Unsupported methods return `405` with an `Allow` header. Unknown paths return a provider-shaped `404` envelope based on the path family.
+
+## Request IDs
+
+Clients may provide:
+
+```http
+X-Request-ID: client-request-123
+```
+
+The value must contain 1–128 visible ASCII characters. The gateway generates a value otherwise and returns it as `X-Request-ID`. If the provider returns its own request ID, llmgw exposes it as `X-LLMGW-Upstream-Request-ID` rather than overwriting the gateway correlation ID.
+
+## Routing behavior
+
+The model in a request is the public route alias. Ingress pins the provider family, then the router filters matching aliases by operation, streaming and feature capabilities, token caps, ACLs, quota allowlists, and body limits. Higher-priority candidates run first; weighted equal-priority candidates choose the initial route, with eligible alternatives available for fallback. Attempt policy checks each candidate's circuit and route/provider capacity immediately before dispatch.
+
+Responses are normally raw provider-native bytes. The gateway patches controlled upstream request fields such as the selected model and authentication. OpenAI compatibility bridges may transform a representable Responses/legacy-completions request and its response.
+
+## Error envelopes
+
+<Tabs>
+  <Tab title="OpenAI-compatible">
+
+```json
+{
+  "error": {
+    "message": "model \"missing\" is not configured",
+    "type": "invalid_request_error",
+    "param": "",
+    "code": "model_not_found"
+  }
+}
+```
+
+  </Tab>
+  <Tab title="Anthropic">
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "not_found_error",
+    "message": "model \"missing\" is not configured"
+  }
+}
+```
+
+  </Tab>
+  <Tab title="Gemini">
+
+```json
+{
+  "error": {
+    "code": 404,
+    "message": "model \"missing\" is not configured",
+    "status": "NOT_FOUND"
+  }
+}
+```
+
+  </Tab>
+</Tabs>
+
+Rate-limit response headers such as `Retry-After`, `x-ratelimit-*`, and provider rate-limit headers are preserved when safe. Upstream authentication failures are mapped so configured provider secrets are not exposed.
+
+## Live schema
+
+Request schemas and configured model enums are available from the running instance:
+
+```bash
+curl --silent http://localhost:8080/openapi.yaml \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+Use the live OpenAPI document for generated clients; it is more authoritative than static prose because it incorporates the active configuration.
+
+<Note>
+  Mintlify runs on `localhost:3000` during documentation development, while the API and its same-origin Swagger UI run on `localhost:8080`. The Mintlify endpoint pages provide copyable examples in simple mode; use curl or the authenticated gateway Swagger UI to execute calls. Direct browser code making cross-origin calls to `:8080` needs a separate proxy because llmgw does not add CORS headers.
+</Note>

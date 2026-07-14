@@ -1,0 +1,183 @@
+---
+title: Security hardening
+description: Production guidance for credentials, network boundaries, upstreams, quotas, and operational access.
+---
+
+llmgw is a data-plane service that holds upstream provider credentials and can generate billable traffic. Treat its listener, configuration, environment, Redis, PostgreSQL, logs, and metrics as security-sensitive.
+
+## Production baseline
+
+```yaml
+server:
+  listen: ":8080"
+  read_timeout: 15s
+  write_timeout: 0s
+  stream_write_timeout: 30s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+
+auth:
+  allow_anonymous: false
+  require_user: true
+  require_project: true
+  max_body_bytes: 4194304
+  token_envs:
+    LLMGW_APPLICATION_TOKEN:
+      id: application
+      key_id: application-prod
+      providers: [openai]
+      models: [fast-chat]
+      projects: [production]
+  # Use a separate credential for operational visibility.
+  # token_envs entries must have unique environment-variable names.
+
+store:
+  mode: redis
+  redis_url_env: LLMGW_REDIS_URL
+  redis_namespace: llmgw-prod-eu1
+  postgres_dsn_env: LLMGW_POSTGRES_DSN
+  quota_table: quota_limits
+
+quota:
+  profiles:
+    application:
+      rpm: 600
+      tpm: 1000000
+      max_parallel: 64
+      budget_duration: 24h
+      max_spend_micros: 100000000
+      model_allowlist: [fast-chat]
+      provider_allowlist: [openai]
+  keys:
+    application-prod: application
+```
+
+## Credential separation
+
+Keep these credentials distinct:
+
+1. **Gateway client credentials** authenticate applications to llmgw (`auth.token_envs` or JWT).
+2. **Upstream provider credentials** authenticate llmgw to OpenAI/Anthropic/Gemini (`routes.*.api_key_env`).
+3. **Operational credentials** grant `view_operations` and, separately when needed, `manage_limits`.
+4. **State-store credentials** connect to Redis and PostgreSQL.
+
+Do not reuse an upstream API key as a gateway bearer token. A leaked client token should be constrained by model/provider/project ACLs and quota without granting direct provider access.
+
+Use environment-backed fields or a process-level secret injection mechanism. Literal `tokens`, `api_key`, JWT keys, Redis URLs, and PostgreSQL DSNs are supported for controlled testing but should not be committed.
+
+## Authentication and least privilege
+
+- Keep `allow_anonymous: false` in any shared environment.
+- Give inference principals no operational permission unless required.
+- Give monitoring credentials only `view_operations`.
+- Give `manage_limits` only to a principal intentionally allowed to replace its own quota record.
+- Constrain principals with `providers`, `models`, and `projects`.
+- Enable `require_user`/`require_project` when those dimensions are part of audit or policy.
+- Use short-lived JWTs with required expiration and narrowly scoped claims where an identity system is available.
+
+The built-in JWT verifier does not fetch JWKS or revoke tokens. Design expiration/rotation accordingly.
+
+## Network and transport
+
+llmgw does not terminate inbound TLS. Deploy it behind a trusted ingress, load balancer, or service mesh that provides:
+
+- TLS with modern cipher/protocol policy;
+- network access control;
+- optional client certificate authentication;
+- request-rate protection at the edge; and
+- trusted forwarding behavior appropriate to your environment.
+
+Bind to loopback for local use. In containers, bind broadly only inside a protected network. `/healthz` and `/readyz` are unauthenticated by design, so restrict them at the network layer if necessary.
+
+Use HTTPS for upstream `base_url` values. For Redis use `rediss://`; for PostgreSQL require and preferably verify TLS. The upstream client refuses redirects, which reduces credential-forwarding risk, but you must still control configured hostnames and DNS/network egress.
+
+## Operational endpoint exposure
+
+`/metrics`, `/openapi.*`, and `/docs/` reveal route/model/provider topology. They require `view_operations` when authentication is enabled.
+
+- Use a dedicated read-only monitoring token.
+- Restrict the paths at ingress/network policy.
+- Do not enable anonymous mode merely to simplify scraping.
+- Treat `/v1/models` as tenant-visible metadata filtered by principal and quota ACLs.
+
+`/healthz` only reports process liveness. `/readyz` deliberately returns a generic dependency error rather than store credentials or internal causes.
+
+## Resource and cost controls
+
+Apply limits at each boundary:
+
+| Boundary | Configuration |
+| --- | --- |
+| Incoming JSON size | `auth.max_body_bytes` |
+| Per-route request compatibility | `routes.*.limits.max_body_bytes` |
+| Upstream response/stream size | `routes.*.limits.max_response_bytes` |
+| Provider call duration | `routes.*.timeout` |
+| Stalled downstream writes | `server.stream_write_timeout` |
+| Route/provider capacity | Route RPM, TPM, concurrency, provider concurrency |
+| Client governance | Key RPM, TPM, max parallel, token and spend budgets |
+| Upstream fault containment | Retries and circuit breaker |
+
+Retries and fallbacks can multiply provider calls and spend. Set them deliberately, price every route, and enforce key spend limits with a finite `budget_duration`.
+
+For hosted tools such as web search, configure `provider_units` with both a price and a worst-case per-request count before enabling hard spend limits.
+
+## Header and metadata safety
+
+Static route headers are validated for HTTP syntax, but configuration can still override provider-specific semantics. Keep them minimal and never store secrets there.
+
+llmgw forwards only selected provider headers plus its own attempt metadata. User/project values are bounded and checked for control characters before becoming headers. Do not use identity headers as a replacement for authentication; they are policy metadata after a principal is authenticated.
+
+Generated/request IDs are returned as `X-Request-ID`. Client-supplied IDs are validated and are not used to steer weighted routing in the normal engine path.
+
+## Shared-store hardening
+
+### Redis
+
+- Use a dedicated writable account with only the commands required by the startup capability probe and runtime scripts.
+- Use a standalone primary; Redis Cluster is not supported.
+- Use `rediss://`, server identity verification, network policy, and a unique namespace.
+- Prevent untrusted users from writing gateway keys or scripts.
+- Monitor connectivity because shared rate/quota/breaker admission fails closed on store errors.
+
+### PostgreSQL
+
+- Use a dedicated database role scoped to the configured quota table and schema creation/update needs.
+- Require TLS and restrict network access.
+- Back up dynamic limit definitions according to control-plane recovery needs.
+- Alert on `llmgw_quota_limit_snapshot_stale` and refresh-failure logs.
+
+Inference reads use a local last-known-good snapshot, so a PostgreSQL outage can leave limits stale while traffic continues. Choose alerting and operational response accordingly.
+
+## Logs and privacy
+
+Normal request logs do not include bodies or configured credentials. They do include request IDs, public model aliases, provider/route names, status, duration, and selected internal error causes.
+
+- Restrict log access and retention.
+- Avoid sensitive data in model/route names, project IDs, user IDs, and upstream error messages.
+- Do not log the resolved configuration or environment.
+- Correlate through request ID instead of copying prompts into logs.
+
+## Change management
+
+- Validate candidate files with `-print-openapi` in CI.
+- Keep configuration and secret changes reviewable but store secret values elsewhere.
+- Replace files atomically and inspect `reloaded`/`reload_failed` logs.
+- Restart for server, store, or telemetry changes.
+- Roll changes through replicas and test an authenticated low-cost request.
+- Rotate client, provider, JWT, Redis, and PostgreSQL credentials independently.
+
+See [Reload and validation](/configuration/reload-and-validation) for the exact validation and rollback behavior.
+
+## Deployment checklist
+
+- [ ] Anonymous access is disabled.
+- [ ] Inbound TLS/network policy is enforced outside llmgw.
+- [ ] All secrets use explicit environment-backed fields.
+- [ ] Client credentials have ACLs and key quotas.
+- [ ] Operational permissions use separate principals.
+- [ ] Upstream routes use HTTPS, realistic capabilities, pricing, timeouts, and byte caps.
+- [ ] Redis uses TLS, a unique namespace, and a supported standalone primary.
+- [ ] PostgreSQL TLS, permissions, and stale-snapshot alerts are configured.
+- [ ] Metrics/docs paths are network-restricted and authenticated.
+- [ ] Health, readiness, error rate, quota settlement, and spend are monitored.
+- [ ] Credential rotation and restart/reload procedures are rehearsed.

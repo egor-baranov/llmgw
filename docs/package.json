@@ -1,0 +1,29 @@
+{
+  "name": "llmgw-docs",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local Mintlify documentation site for llmgw",
+  "scripts": {
+    "sync:openapi": "node scripts/sync-openapi.mjs",
+    "dev": "npm run sync:openapi && node scripts/run-mint.mjs dev",
+    "dev:no-open": "npm run sync:openapi && node scripts/run-mint.mjs dev --no-open",
+    "validate": "npm run sync:openapi && node scripts/run-mint.mjs validate",
+    "broken-links": "node scripts/run-mint.mjs broken-links",
+    "a11y": "node scripts/run-mint.mjs a11y"
+  },
+  "devDependencies": {
+    "mint": "4.2.694",
+    "node": "24.18.0"
+  },
+  "overrides": {
+    "js-yaml@^4.0.0": "4.2.0",
+    "qs": "6.15.3",
+    "tar": "7.5.20"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "allowScripts": {
+    "node@24.18.0": true
+  }
+}

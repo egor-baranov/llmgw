@@ -4,52 +4,97 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"mime"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"llmgw/gateway"
 )
 
 type Provider struct {
-	name   string
-	client *http.Client
+	adapter Adapter
+	client  *http.Client
 }
 
-var supportedOperationsByProvider = map[string]map[gateway.Operation]struct{}{
-	"openai": {
-		gateway.OpChatCompletions: {},
-		gateway.OpResponses:       {},
-		gateway.OpCompletions:     {},
-		gateway.OpEmbeddings:      {},
-	},
-	"anthropic": {
-		gateway.OpChatCompletions: {},
-	},
-	"gemini": {
-		gateway.OpChatCompletions: {},
-		gateway.OpEmbeddings:      {},
-	},
+const (
+	maxUnaryResponseBytes     = int64(16 << 20)
+	maxEmbeddingResponseBytes = int64(64 << 20)
+	maxUpstreamErrorBytes     = int64(1 << 20)
+)
+
+var legacyAdapterFactories = map[string]func() Adapter{
+	"anthropic": AnthropicAdapter,
+	"gemini":    GeminiAdapter,
+	"openai":    OpenAIAdapter,
 }
 
+// New preserves the original name-based constructor for package consumers.
+// Deprecated: use NewProvider with an explicit adapter.
 func New(name string, client *http.Client) *Provider {
+	if factory := legacyAdapterFactories[name]; factory != nil {
+		return NewProvider(factory(), client)
+	}
+	return NewProvider(Adapter{Name: name}, client)
+}
+
+// NewProvider constructs the generic transport runtime around an explicit
+// adapter. The gateway.Provider interface remains unchanged.
+func NewProvider(adapter Adapter, client *http.Client) *Provider {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &Provider{name: name, client: client}
+	// API calls are expected to target their final endpoint. Refusing redirects
+	// prevents provider credentials in non-standard headers from being copied to
+	// an unrelated host by net/http's redirect machinery.
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Provider{adapter: cloneAdapter(adapter), client: &safeClient}
 }
 
-func (p *Provider) Name() string { return p.name }
+func (p *Provider) Name() string { return p.adapter.Name }
 
 func (p *Provider) Supports(op gateway.Operation) bool {
-	supported, ok := supportedOperationsByProvider[p.name]
-	if !ok {
-		return false
-	}
-	_, ok = supported[op]
+	_, ok := p.adapter.operation(op)
 	return ok
+}
+
+// ValidateRoute lets config assembly delegate provider-specific route semantics
+// without expanding gateway.Provider's hot-path interface.
+func (p *Provider) ValidateRoute(route *gateway.Route) error {
+	if route == nil {
+		return gateway.UnsupportedOperation("missing route")
+	}
+	if p.adapter.Name != "" && route.Provider != "" && route.Provider != p.adapter.Name {
+		return fmt.Errorf("route %s provider %q does not match adapter %q", route.Name, route.Provider, p.adapter.Name)
+	}
+	if p.adapter.ValidateRoute != nil {
+		return p.adapter.ValidateRoute(route)
+	}
+	return nil
+}
+
+// PlanBridge delegates compatibility routing to the provider protocol adapter.
+// Routers call this only when the route lacks native support for the request.
+func (p *Provider) PlanBridge(route *gateway.Route, req *gateway.Request) (gateway.Operation, string, bool) {
+	if p.adapter.PlanBridge == nil {
+		return "", "route does not support requested operation", false
+	}
+	return p.adapter.PlanBridge(route, req)
+}
+
+// ProjectTokenText removes provider-specific inline binary payloads before a
+// tokenizer sees the request. Unknown adapters conservatively retain raw JSON.
+func (p *Provider) ProjectTokenText(raw json.RawMessage) string {
+	if p.adapter.ProjectTokenText == nil {
+		return string(raw)
+	}
+	return p.adapter.ProjectTokenText(raw)
 }
 
 func (p *Provider) BuildEffective(_ gateway.ResolvedRoute, req *gateway.Request) (*gateway.EffectiveParams, error) {
@@ -60,145 +105,276 @@ func (p *Provider) BuildEffective(_ gateway.ResolvedRoute, req *gateway.Request)
 	return effective, nil
 }
 
-func (p *Provider) Invoke(ctx context.Context, route gateway.ResolvedRoute, req *gateway.Request) (*gateway.Result, error) {
-	body, targetURL, err := p.prepare(route, req)
-	if err != nil {
-		return nil, err
+func (p *Provider) Preflight(route gateway.ResolvedRoute, req *gateway.Request) error {
+	if p.adapter.Preflight == nil {
+		return nil
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	return p.adapter.Preflight(route, req)
+}
+
+func (p *Provider) Invoke(ctx context.Context, route gateway.ResolvedRoute, req *gateway.Request) (*gateway.Result, error) {
+	if req == nil {
+		return nil, gateway.WithoutAttemptCharge(gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_request", "request is required"))
+	}
+	operation, ok := p.adapter.operation(req.Operation)
+	if !ok {
+		return nil, gateway.WithoutAttemptCharge(gateway.UnsupportedOperation("provider adapter does not support requested operation"))
+	}
+	prepared, err := operation.Prepare(route, req)
 	if err != nil {
-		return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "request_failed", err.Error())
+		return nil, gateway.WithoutAttemptCharge(err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, prepared.URL, bytes.NewReader(prepared.Body))
+	if err != nil {
+		return nil, gateway.WithoutAttemptCharge(gateway.NewError(http.StatusBadGateway, "upstream_error", "request_failed", "could not build upstream request"))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	applyRequestHeaders(httpReq, route, req.Meta)
-	if err := applyProviderAuth(httpReq, route.Route); err != nil {
-		return nil, err
+	applyRequestHeaders(httpReq, route, req.Meta, p.adapter.ForwardHeaders)
+	if p.adapter.ApplyAuth != nil {
+		if err := p.adapter.ApplyAuth(httpReq, route.Route); err != nil {
+			return nil, gateway.WithoutAttemptCharge(err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, gateway.WithoutAttemptCharge(err)
 	}
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "request_failed", err.Error())
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, context.Canceled
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, gateway.NewError(http.StatusGatewayTimeout, "upstream_error", "upstream_timeout", "upstream request timed out").
+				WithCause(err).
+				WithDisposition(true, true, true)
+		}
+		return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "request_failed", "upstream request failed").
+			WithCause(err).
+			WithDisposition(true, true, true)
 	}
+	limit := responseBodyLimit(route, req)
 	if req.Stream {
-		if resp.StatusCode >= 300 {
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			return nil, readUpstreamError(resp.StatusCode, body)
+			body, tooLarge, readErr := readBounded(resp.Body, maxUpstreamErrorBytes)
+			if readErr != nil {
+				return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "read_failed", "failed to read upstream response").
+					WithCause(readErr).
+					WithDisposition(true, true, true)
+			}
+			if tooLarge {
+				return nil, responseTooLargeError()
+			}
+			return nil, upstreamAttemptError(resp.StatusCode, p.parseError(resp.StatusCode, body), p.extractUsage(route, req, body), safeUpstreamErrorHeaders(resp.Header))
+		}
+		mediaType, _, mediaErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if mediaErr != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+			_ = resp.Body.Close()
+			return nil, invalidUpstreamResponse("stream response is not SSE")
+		}
+		tracker := newStreamUsageTracker(p.adapter.Stream, route, req)
+		responseHeaders := cloneHeaders(resp.Header)
+		stripEchoedRequestHeaders(responseHeaders, httpReq.Header)
+		stream := tracker.Wrap(newResponseLimitReadCloser(resp.Body, limit))
+		transformed := false
+		if p.adapter.Stream.Transform != nil {
+			current := stream
+			stream, transformed, err = p.adapter.Stream.Transform(route, req, current)
+			if err != nil {
+				_ = current.Close()
+				return nil, err
+			}
+			if stream == nil {
+				_ = current.Close()
+				return nil, gateway.NewError(http.StatusInternalServerError, "server_error", "invalid_adapter", "provider stream adapter returned no stream")
+			}
+		}
+		if transformed {
+			stream = newResponseLimitReadCloser(stream, limit)
+			stripTransformedResponseHeaders(responseHeaders)
 		}
 		return &gateway.Result{
-			StatusCode:  resp.StatusCode,
-			Headers:     cloneHeaders(resp.Header),
-			ContentType: firstNonEmpty(resp.Header.Get("Content-Type"), "text/event-stream"),
-			RawStream:   resp.Body,
-			Usage:       fallbackUsage(req, route.Route.Capabilities.Tokenizer),
+			StatusCode:    resp.StatusCode,
+			Headers:       responseHeaders,
+			ContentType:   firstNonEmpty(resp.Header.Get("Content-Type"), "text/event-stream"),
+			RawStream:     stream,
+			Usage:         fallbackUsage(req, route.Estimate),
+			UsageSnapshot: tracker.Usage,
 		}, nil
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		limit = maxUpstreamErrorBytes
+	}
+	data, tooLarge, err := readBounded(resp.Body, limit)
 	if err != nil {
-		return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "read_failed", err.Error())
+		return nil, gateway.NewError(http.StatusBadGateway, "upstream_error", "read_failed", "failed to read upstream response").
+			WithCause(err).
+			WithDisposition(true, true, true)
 	}
-	if resp.StatusCode >= 300 {
-		return nil, readUpstreamError(resp.StatusCode, data)
+	if tooLarge {
+		return nil, responseTooLargeError()
 	}
-	usage := extractUsage(p.name, data)
-	if usage.IsZero() {
-		usage = fallbackUsage(req, route.Route.Capabilities.Tokenizer)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, upstreamAttemptError(resp.StatusCode, p.parseError(resp.StatusCode, data), p.extractUsage(route, req, data), safeUpstreamErrorHeaders(resp.Header))
 	}
+	if operation.ValidateResponse != nil {
+		if err := operation.ValidateResponse(data); err != nil {
+			return nil, err
+		}
+	}
+	usage := p.extractUsage(route, req, data)
+	responseHeaders := cloneHeaders(resp.Header)
+	stripEchoedRequestHeaders(responseHeaders, httpReq.Header)
+	contentType := firstNonEmpty(resp.Header.Get("Content-Type"), "application/json")
+	transformed := false
+	if p.adapter.TransformResponse != nil {
+		data, transformed, err = p.adapter.TransformResponse(route, req, data)
+		if err != nil {
+			return nil, gateway.WithAttemptUsage(gateway.AllowFallback(err), usage)
+		}
+	}
+	if transformed {
+		if int64(len(data)) > limit {
+			return nil, responseTooLargeError()
+		}
+		stripTransformedResponseHeaders(responseHeaders)
+		contentType = "application/json"
+	}
+	usage = gateway.ReconcileReportedUsage(usage, fallbackUsage(req, route.Estimate))
 	return &gateway.Result{
 		StatusCode:  resp.StatusCode,
-		Headers:     cloneHeaders(resp.Header),
-		ContentType: firstNonEmpty(resp.Header.Get("Content-Type"), "application/json"),
+		Headers:     responseHeaders,
+		ContentType: contentType,
 		RawBody:     data,
 		Usage:       usage,
 	}, nil
 }
 
-func (p *Provider) prepare(route gateway.ResolvedRoute, req *gateway.Request) ([]byte, string, error) {
-	switch p.name {
-	case "openai":
-		return prepareOpenAI(route, req)
-	case "anthropic":
-		return prepareAnthropic(route, req)
-	case "gemini":
-		return prepareGemini(route, req)
-	default:
-		return nil, "", gateway.UnsupportedOperation("unsupported provider proxy")
+func (p *Provider) parseError(status int, body []byte) error {
+	if p.adapter.ParseError != nil {
+		if err := p.adapter.ParseError(status, body); err != nil {
+			return err
+		}
+	}
+	return genericUpstreamError(status)
+}
+
+func (p *Provider) extractUsage(route gateway.ResolvedRoute, req *gateway.Request, body []byte) gateway.Usage {
+	if p.adapter.ExtractUsage == nil {
+		return gateway.Usage{}
+	}
+	return p.adapter.ExtractUsage(route, req, body)
+}
+
+/*
+	Provider-specific request preparation, validation, error decoding, usage
+	extraction, and stream terminal semantics live in adapter_*.go. Keep the
+	remaining helpers below protocol-neutral so adding an adapter cannot require a
+	core switch.
+*/
+
+func invalidUpstreamResponse(detail string) error {
+	return gateway.NewError(http.StatusBadGateway, "upstream_error", "invalid_upstream_response", "upstream returned an invalid response: "+detail).
+		WithDisposition(false, true, true)
+}
+
+func responseBodyLimit(route gateway.ResolvedRoute, req *gateway.Request) int64 {
+	limit := maxUnaryResponseBytes
+	if req != nil && req.Operation == gateway.OpEmbeddings {
+		limit = maxEmbeddingResponseBytes
+	}
+	if route.Route != nil && route.Route.Limits.MaxResponseBytes > 0 {
+		limit = route.Route.Limits.MaxResponseBytes
+	}
+	return limit
+}
+
+func responseTooLargeError() error {
+	return gateway.NewError(http.StatusBadGateway, "upstream_error", "response_too_large", "upstream response exceeds the gateway limit").
+		WithDisposition(false, true, false)
+}
+
+func upstreamAttemptError(status int, err error, usage gateway.Usage, headers http.Header) error {
+	err = gateway.WithResponseHeaders(err, headers)
+	// Providers do not bill ordinary rejected 4xx calls when they report no
+	// usage. In particular, charging a full completion estimate for a 429 would
+	// make a healthy fallback look as expensive as two generated responses.
+	if status < http.StatusInternalServerError && usage.IsZero() {
+		return gateway.WithoutAttemptCharge(err)
+	}
+	return gateway.WithAttemptUsage(err, usage)
+}
+
+func safeUpstreamErrorHeaders(headers http.Header) http.Header {
+	out := make(http.Header)
+	for key, values := range headers {
+		lower := strings.ToLower(key)
+		if !strings.EqualFold(key, "Retry-After") &&
+			!strings.EqualFold(key, "X-Request-ID") &&
+			!strings.EqualFold(key, "Request-ID") &&
+			!strings.HasPrefix(lower, "x-ratelimit-") &&
+			!strings.HasPrefix(lower, "ratelimit-") &&
+			!strings.HasPrefix(lower, "anthropic-ratelimit-") {
+			continue
+		}
+		for _, value := range values {
+			out.Add(key, value)
+		}
+	}
+	return out
+}
+
+func stripTransformedResponseHeaders(headers http.Header) {
+	for _, key := range []string{
+		"Content-Length",
+		"Content-Encoding",
+		"Content-Range",
+		"Content-MD5",
+		"Digest",
+		"Content-Digest",
+		"Repr-Digest",
+		"ETag",
+	} {
+		headers.Del(key)
 	}
 }
 
-func prepareOpenAI(route gateway.ResolvedRoute, req *gateway.Request) ([]byte, string, error) {
-	body, err := patchBody(req.RawBody, map[string]any{"model": route.Route.Model})
-	if err != nil {
-		return nil, "", gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
-	}
-	return body, joinURL(route.Route.BaseURL, openAIPath(req.Operation)), nil
-}
-
-func prepareAnthropic(route gateway.ResolvedRoute, req *gateway.Request) ([]byte, string, error) {
-	body, err := patchBody(req.RawBody, map[string]any{"model": route.Route.Model})
-	if err != nil {
-		return nil, "", gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
-	}
-	return body, joinURL(route.Route.BaseURL, "messages"), nil
-}
-
-func prepareGemini(route gateway.ResolvedRoute, req *gateway.Request) ([]byte, string, error) {
-	if strings.EqualFold(route.Route.Backend, "vertex") || route.Route.Project != "" || route.Route.Location != "" {
-		return nil, "", gateway.UnsupportedOperation("vertex gemini proxy mode is not supported")
-	}
-	body, err := patchBody(req.RawBody, map[string]any{"model": nil})
-	if err != nil {
-		return nil, "", gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
-	}
-	target, err := geminiURL(route.Route, req.Operation)
-	if err != nil {
-		return nil, "", err
-	}
-	return body, target, nil
-}
-
-func openAIPath(op gateway.Operation) string {
-	switch op {
-	case gateway.OpChatCompletions:
-		return "chat/completions"
-	case gateway.OpResponses:
-		return "responses"
-	case gateway.OpCompletions:
-		return "completions"
-	case gateway.OpEmbeddings:
-		return "embeddings"
-	default:
-		return ""
+// stripEchoedRequestHeaders removes same-name request metadata before response
+// headers leave the proxy boundary. This protects arbitrary route-configured
+// credentials whose names are not known to the API denylist. A small set of
+// headers with legitimate request and response semantics is retained.
+func stripEchoedRequestHeaders(response, request http.Header) {
+	for key := range request {
+		if responseHeaderMayOverlapRequest(key) {
+			continue
+		}
+		response.Del(key)
 	}
 }
 
-func geminiURL(route *gateway.Route, op gateway.Operation) (string, error) {
-	if route == nil {
-		return "", gateway.UnsupportedOperation("missing route")
+func responseHeaderMayOverlapRequest(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	switch lower {
+	case "accept-ranges", "age", "allow", "alt-svc", "cache-control",
+		"content-digest", "content-disposition", "content-encoding", "content-language", "content-length",
+		"content-location", "content-range", "content-type", "date", "digest", "etag", "expires",
+		"last-modified", "link", "location", "request-id", "repr-digest", "retry-after", "server",
+		"timing-allow-origin", "vary", "warning", "www-authenticate", "x-correlation-id", "x-request-id":
+		return true
 	}
-	version := firstNonEmpty(route.APIVersion, "v1beta")
-	var suffix string
-	switch op {
-	case gateway.OpChatCompletions:
-		suffix = ":generateContent"
-	case gateway.OpEmbeddings:
-		suffix = ":embedContent"
-	default:
-		return "", gateway.UnsupportedOperation("gemini proxy only supports chat and embeddings")
-	}
-	base := strings.TrimRight(route.BaseURL, "/")
-	target := fmt.Sprintf("%s/%s/models/%s%s", base, strings.TrimLeft(version, "/"), url.PathEscape(route.Model), suffix)
-	if route.APIKey != "" {
-		values := url.Values{}
-		values.Set("key", route.APIKey)
-		target += "?" + values.Encode()
-	}
-	return target, nil
+	return strings.HasPrefix(lower, "access-control-") ||
+		strings.HasPrefix(lower, "x-ratelimit-") ||
+		strings.HasPrefix(lower, "ratelimit-") ||
+		strings.HasPrefix(lower, "anthropic-ratelimit-")
 }
 
-func applyRequestHeaders(req *http.Request, resolved gateway.ResolvedRoute, meta gateway.Meta) {
+func applyRequestHeaders(req *http.Request, resolved gateway.ResolvedRoute, meta gateway.Meta, forward func(http.Header, http.Header)) {
 	if meta.RequestID != "" {
 		req.Header.Set("X-Request-ID", meta.RequestID)
+	}
+	if forward != nil {
+		forward(req.Header, meta.Headers)
 	}
 	for key, value := range resolved.Route.Headers {
 		req.Header.Set(key, value)
@@ -211,132 +387,68 @@ func applyRequestHeaders(req *http.Request, resolved gateway.ResolvedRoute, meta
 	}
 }
 
-func applyProviderAuth(req *http.Request, route *gateway.Route) error {
-	if route == nil {
-		return gateway.UnsupportedOperation("missing route")
+func forwardSelectedHeaders(dst, src http.Header, keys ...string) {
+	for _, key := range keys {
+		for _, value := range src.Values(key) {
+			dst.Add(key, value)
+		}
 	}
-	switch route.Provider {
-	case "openai":
-		if route.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+route.APIKey)
-		}
-	case "anthropic":
-		if route.APIKey != "" {
-			req.Header.Set("x-api-key", route.APIKey)
-		}
-		if req.Header.Get("anthropic-version") == "" {
-			req.Header.Set("anthropic-version", "2023-06-01")
-		}
-	case "gemini":
-		if route.APIKey != "" {
-			req.Header.Set("x-goog-api-key", route.APIKey)
-		}
-		if req.Header.Get("x-goog-api-client") == "" {
-			req.Header.Set("x-goog-api-client", "llmgw/1.0 gateway/aggregator")
-		}
+}
+
+func unsupportedRouteBackend(route *gateway.Route) error {
+	return fmt.Errorf("route %s uses unsupported backend %q for provider %s", route.Name, route.Backend, route.Provider)
+}
+
+func unsupportedProjectLocation(route *gateway.Route) error {
+	return fmt.Errorf("route %s project/location routing is not supported by the configured provider proxy", route.Name)
+}
+
+func genericUpstreamError(status int) error {
+	return withUpstreamDisposition(gateway.NewError(status, "upstream_error", "upstream_error", fmt.Sprintf("upstream returned %d", status)), status)
+}
+
+func withUpstreamDisposition(err *gateway.APIError, status int) error {
+	switch {
+	case status < http.StatusOK || (status >= http.StatusMultipleChoices && status < http.StatusBadRequest) || status > 599:
+		return gateway.NewError(http.StatusBadGateway, "upstream_error", "unexpected_upstream_status", "upstream returned an unexpected HTTP status").
+			WithDisposition(false, true, true)
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return gateway.NewError(http.StatusBadGateway, "upstream_error", "upstream_authentication_failed", "upstream route authentication failed").
+			WithDisposition(false, true, true)
+	case status == http.StatusNotFound && routeLocalNotFound(err):
+		return gateway.NewError(http.StatusBadGateway, "upstream_error", "upstream_route_not_found", "upstream route or model was not found").
+			WithDisposition(false, true, true)
+	case status >= http.StatusInternalServerError:
+		return err.WithDisposition(true, true, true)
+	case status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly:
+		return err.WithDisposition(true, true, false)
+	case status == http.StatusTooManyRequests:
+		return err.WithDisposition(false, true, false)
 	default:
-		return gateway.UnsupportedOperation("unsupported provider proxy")
+		return err
 	}
-	return nil
 }
 
-func readUpstreamError(status int, body []byte) error {
-	var openAI struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-		} `json:"error"`
+func routeLocalNotFound(err *gateway.APIError) bool {
+	if err == nil {
+		return false
 	}
-	if err := json.Unmarshal(body, &openAI); err == nil && openAI.Error.Message != "" {
-		return gateway.NewError(status, firstNonEmpty(openAI.Error.Type, "upstream_error"), openAI.Error.Code, openAI.Error.Message)
+	value := strings.ToLower(err.Code + " " + err.Message)
+	for _, marker := range []string{"model", "deployment", "endpoint"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
 	}
-	var anthropic struct {
-		Error struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &anthropic); err == nil && anthropic.Error.Message != "" {
-		return gateway.NewError(status, firstNonEmpty(anthropic.Error.Type, "upstream_error"), "upstream_error", anthropic.Error.Message)
-	}
-	var gemini struct {
-		Error struct {
-			Message string `json:"message"`
-			Status  string `json:"status"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &gemini); err == nil && gemini.Error.Message != "" {
-		return gateway.NewError(status, "upstream_error", strings.ToLower(gemini.Error.Status), gemini.Error.Message)
-	}
-	return gateway.NewError(status, "upstream_error", "upstream_error", fmt.Sprintf("upstream returned %d", status))
+	return false
 }
 
-func extractUsage(provider string, body []byte) gateway.Usage {
-	switch provider {
-	case "openai":
-		var wire struct {
-			Usage struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-				TotalTokens      int64 `json:"total_tokens"`
-			} `json:"usage"`
+func fallbackUsage(req *gateway.Request, routeEstimate gateway.Usage) gateway.Usage {
+	if !routeEstimate.IsZero() {
+		if routeEstimate.TotalTokens == 0 {
+			routeEstimate.TotalTokens = saturatingProxyAdd(routeEstimate.InputTokens, routeEstimate.OutputTokens)
 		}
-		if json.Unmarshal(body, &wire) == nil {
-			return gateway.Usage{
-				InputTokens:  wire.Usage.PromptTokens,
-				OutputTokens: wire.Usage.CompletionTokens,
-				TotalTokens:  wire.Usage.TotalTokens,
-			}
-		}
-	case "anthropic":
-		var wire struct {
-			Usage struct {
-				InputTokens  int64 `json:"input_tokens"`
-				OutputTokens int64 `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal(body, &wire) == nil {
-			return gateway.Usage{
-				InputTokens:  wire.Usage.InputTokens,
-				OutputTokens: wire.Usage.OutputTokens,
-				TotalTokens:  wire.Usage.InputTokens + wire.Usage.OutputTokens,
-			}
-		}
-	case "gemini":
-		var wire struct {
-			Usage struct {
-				PromptTokenCount        int64 `json:"promptTokenCount"`
-				CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
-				TotalTokenCount         int64 `json:"totalTokenCount"`
-				CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
-				ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount"`
-				ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
-			} `json:"usageMetadata"`
-		}
-		if json.Unmarshal(body, &wire) == nil {
-			usage := gateway.Usage{
-				InputTokens:     wire.Usage.PromptTokenCount,
-				OutputTokens:    wire.Usage.CandidatesTokenCount,
-				TotalTokens:     wire.Usage.TotalTokenCount,
-				CacheReadTokens: wire.Usage.CachedContentTokenCount,
-			}
-			if wire.Usage.ToolUsePromptTokenCount > 0 {
-				usage.InputDetails = &gateway.UsageDetails{ToolTokens: wire.Usage.ToolUsePromptTokenCount}
-			}
-			if wire.Usage.ThoughtsTokenCount > 0 {
-				if usage.OutputDetails == nil {
-					usage.OutputDetails = &gateway.UsageDetails{}
-				}
-				usage.OutputDetails.ReasoningTokens = wire.Usage.ThoughtsTokenCount
-			}
-			return usage
-		}
+		return routeEstimate
 	}
-	return gateway.Usage{}
-}
-
-func fallbackUsage(req *gateway.Request, tokenizer string) gateway.Usage {
 	text := strings.TrimSpace(req.PromptText())
 	in := req.Hints.EstimatedInputTokens
 	if in == 0 && req.Meta.BodyBytes > 0 {
@@ -361,8 +473,42 @@ func fallbackUsage(req *gateway.Request, tokenizer string) gateway.Usage {
 	return gateway.Usage{
 		InputTokens:  in,
 		OutputTokens: out,
-		TotalTokens:  in + out,
+		TotalTokens:  saturatingProxyAdd(in, out),
 	}
+}
+
+func readBounded(reader io.Reader, limit int64) ([]byte, bool, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, saturatingProxyAdd(limit, 1)))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) > limit {
+		return nil, true, nil
+	}
+	return data, false, nil
+}
+
+func saturatingProxyAdd(first, second int64) int64 {
+	if first < 0 {
+		first = 0
+	}
+	if second < 0 {
+		second = 0
+	}
+	if first > math.MaxInt64-second {
+		return math.MaxInt64
+	}
+	return first + second
+}
+
+func upstreamModel(route *gateway.Route) string {
+	if route == nil {
+		return ""
+	}
+	if route.UpstreamModel != "" {
+		return route.UpstreamModel
+	}
+	return route.Model
 }
 
 func patchBody(body []byte, overrides map[string]any) ([]byte, error) {

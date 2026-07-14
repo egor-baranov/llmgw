@@ -2,21 +2,29 @@ server:
   listen: ":8080"
   read_timeout: 15s
   write_timeout: 0s
+  # Downstream write-idle deadline for unary responses and each SSE chunk.
+  stream_write_timeout: 30s
   idle_timeout: 60s
   shutdown_timeout: 10s
 
 auth:
+  allow_anonymous: false
   require_user: false
   require_project: false
   max_body_bytes: 4194304
-  tokens:
-    local-dev-token:
+  # Environment-backed tokens keep bearer secrets out of the image and config.
+  # Startup fails if a listed environment variable is missing or empty.
+  token_envs:
+    LLMGW_BEARER_TOKEN:
       id: dev
       name: local-dev
       key_id: dev-key
-      quota_key: dev
       providers: [openai, anthropic, gemini]
-      models: [gpt-4o-mini, claude-3-7-sonnet-latest, gemini-2.5-flash]
+      models: [gpt-4o-mini, text-embedding-3-small, claude-sonnet-4-6, gemini-2.5-flash, gemini-embedding-2]
+      # The default inference credential can inspect operations but cannot
+      # rewrite its own quota. Configure a separate admin/JWT principal with
+      # manage_limits when dynamic limit management is needed.
+      permissions: [view_operations]
   # jwt:
   #   algorithm: HS256
   #   issuer: llmgw
@@ -25,13 +33,22 @@ auth:
   #   claims:
   #     principal: sub
   #     key_id: key_id
+  #     permissions: permissions
 
 store:
   mode: memory
+  # Shared production state: use an environment-backed rediss:// URL and a
+  # namespace unique to this deployment. Plaintext redis:// and redis_addr are
+  # for local development or explicitly trusted, isolated networks only. The
+  # Lua-backed store currently targets a standalone Redis primary, not Cluster.
+  # redis_url_env: LLMGW_REDIS_URL
+  # redis_namespace: llmgw-production
+  # Legacy local form: redis_addr, redis_password_env, and redis_db.
   # postgres_dsn_env: LLMGW_POSTGRES_DSN
   # quota_table: quota_limits
   limit_cache_ttl: 30s
   reservation_ttl: 10m
+  startup_timeout: 10s
 
 telemetry:
   service_name: llmgw
@@ -40,7 +57,6 @@ quota:
   profiles:
     dev-token:
       max_parallel: 32
-      max_spend_micros: 5000000
       daily_tokens: 1000000
   keys:
     dev-key: dev-token
@@ -48,6 +64,7 @@ quota:
 routes:
   openai-primary:
     provider: openai
+    # model is the public gateway alias; upstream_model defaults to model when omitted.
     model: gpt-4o-mini
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -64,13 +81,14 @@ routes:
       failures: 3
       cooldown: 30s
     capabilities:
-      operations: [chat.completions, responses, completions, embeddings]
+      operations: [chat.completions, responses]
       streaming: true
       tool_calling: true
       structured_output: true
       vision_input: true
+      vision_input_token_surcharge: 1024
       audio: false
-      reasoning: true
+      reasoning: false
       max_input_tokens: 128000
       max_output_tokens: 16384
       tokenizer: o200k_base
@@ -78,39 +96,37 @@ routes:
       input_per_1m: 0.15
       output_per_1m: 0.60
 
-  anthropic-fallback:
-    provider: anthropic
-    model: claude-3-7-sonnet-latest
-    base_url: https://api.anthropic.com/v1
-    api_key_env: ANTHROPIC_API_KEY
-    priority: 90
+  openai-embeddings:
+    provider: openai
+    model: text-embedding-3-small
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    priority: 100
     weight: 100
     timeout: 30s
-    headers:
-      anthropic-version: "2023-06-01"
     limits:
-      rpm: 2000
-      tpm: 1000000
-      concurrency: 128
-      provider_concurrency: 128
+      rpm: 3000
+      tpm: 2000000
+      concurrency: 256
+      provider_concurrency: 256
+      max_body_bytes: 4194304
     circuit:
       failures: 3
       cooldown: 30s
     capabilities:
-      operations: [chat.completions]
-      streaming: true
-      tool_calling: true
-      structured_output: true
+      operations: [embeddings]
+      streaming: false
+      tool_calling: false
+      structured_output: false
       vision_input: false
       audio: false
-      reasoning: true
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      tokenizer: claude
+      reasoning: false
+      max_input_tokens: 8192
+      tokenizer: cl100k_base
 
   anthropic-primary:
     provider: anthropic
-    model: claude-3-7-sonnet-latest
+    model: claude-sonnet-4-6
     base_url: https://api.anthropic.com/v1
     api_key_env: ANTHROPIC_API_KEY
     priority: 100
@@ -131,12 +147,16 @@ routes:
       streaming: true
       tool_calling: true
       structured_output: true
-      vision_input: false
+      vision_input: true
+      vision_input_token_surcharge: 1600
       audio: false
       reasoning: true
-      max_input_tokens: 200000
-      max_output_tokens: 8192
+      max_input_tokens: 1000000
+      max_output_tokens: 65536
       tokenizer: claude
+    pricing:
+      input_per_1m: 3.00
+      output_per_1m: 15.00
 
   gemini-primary:
     provider: gemini
@@ -157,12 +177,14 @@ routes:
       failures: 3
       cooldown: 30s
     capabilities:
-      operations: [chat.completions, embeddings]
+      operations: [chat.completions]
       streaming: true
       tool_calling: true
       structured_output: true
       vision_input: true
+      vision_input_token_surcharge: 1024
       audio: true
+      audio_input_token_surcharge: 8192
       reasoning: true
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -171,10 +193,42 @@ routes:
       input_per_1m: 0.30
       output_per_1m: 2.50
 
+  gemini-embeddings:
+    provider: gemini
+    backend: gemini
+    model: gemini-embedding-2
+    base_url: https://generativelanguage.googleapis.com
+    api_key_env: GEMINI_API_KEY
+    api_version: v1beta
+    priority: 100
+    weight: 100
+    timeout: 30s
+    limits:
+      rpm: 2000
+      tpm: 1000000
+      concurrency: 128
+      provider_concurrency: 128
+    circuit:
+      failures: 3
+      cooldown: 30s
+    capabilities:
+      operations: [embeddings]
+      streaming: false
+      tool_calling: false
+      structured_output: false
+      vision_input: true
+      vision_input_token_surcharge: 1024
+      audio: true
+      audio_input_token_surcharge: 8192
+      reasoning: false
+      max_input_tokens: 8192
+      tokenizer: gemini
+
 # Example OpenAI-compatible third-party route:
 #   ollama-local:
 #     provider: openai
 #     model: llama3.1:8b
+#     upstream_model: llama3.1:8b
 #     base_url: http://localhost:11434/v1
 #     api_key_env: OPENAI_COMPAT_API_KEY
 #     priority: 80

@@ -1,0 +1,79 @@
+---
+title: Observability
+description: Health checks, JSON logs, Prometheus metrics, request correlation, tracing hooks, and operational endpoint access.
+---
+
+llmgw emits structured logs to stdout and serves Prometheus-format metrics from the same HTTP listener. Request and attempt telemetry deliberately have separate lifetimes, so retries and fallback remain visible.
+
+## Health endpoints
+
+| Endpoint | Authentication | Meaning |
+| --- | --- | --- |
+| `GET /healthz` | None | Process liveness; returns `200` while the HTTP process can serve requests |
+| `GET /readyz` | None | Configuration is loaded and each external store health check passes within two seconds |
+
+Readiness checks Redis with `PING`. For PostgreSQL-backed quota limits, readiness verifies that a usable in-memory snapshot exists; a later background refresh failure preserves the last known-good snapshot and is reported through logs and `llmgw_quota_limit_snapshot_stale` rather than taking the data plane out of readiness.
+
+Neither endpoint probes model providers. Provider health is handled on the request path by timeouts, retries, fallback, and circuit breakers.
+
+## Operational endpoint authorization
+
+`/metrics`, `/openapi.json`, `/openapi.yaml`, and the built-in `/docs/` Swagger UI are protected. A bearer principal needs the `view_operations` permission. When `auth.allow_anonymous` is explicitly enabled, they are accessible without a token.
+
+```bash
+curl -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  http://localhost:8080/metrics
+```
+
+The liveness and readiness endpoints remain unauthenticated so container orchestrators can probe them.
+
+## JSON logs
+
+[`observer.New`](https://github.com/egor-baranov/llmgw/blob/main/observer/observer.go) configures Go `slog` with a JSON handler at info level. Every record includes `service`, set by `telemetry.service_name` and defaulting to `llmgw`.
+
+Normal traffic emits:
+
+- `request` with `request_id`, operation, bounded model label, status, duration, and selected route/provider when available;
+- `attempt` with request ID, route, provider, status, duration, and an error code on failure.
+
+For streams, request and attempt durations end at EOF, close, or settlement rather than when upstream headers arrive. Additional events cover failed reloads, quota settlement, downstream response writes, and PostgreSQL quota-snapshot refreshes.
+
+Do not use request bodies or bearer/API keys as log fields. The built-in telemetry does not log them, and it replaces request-path error causes with bounded HTTP categories before sending them to logs or tracer hooks.
+
+## Request correlation
+
+llmgw accepts a bounded, validated `X-Request-ID` or generates one and returns it on every response. It also sends gateway-controlled correlation headers upstream:
+
+- `X-LLMGW-Request-ID`
+- `X-LLMGW-Attempt` and `X-LLMGW-Retry`
+- `X-LLMGW-Attempt-ID`
+- `X-LLMGW-Provider`, `X-LLMGW-Route`, and `X-LLMGW-Model`
+
+Safe user and project values are forwarded as `X-LLMGW-User` and `X-LLMGW-Project`. If an upstream returns its own `X-Request-ID`, clients receive it as `X-LLMGW-Upstream-Request-ID`, preserving the gateway request ID namespace.
+
+## Metrics
+
+The VictoriaMetrics metrics library exposes Prometheus text format. The primary series are:
+
+| Metric | Type and labels | Meaning |
+| --- | --- | --- |
+| `llmgw_inflight_requests` | gauge | Requests whose response and settlement have not completed |
+| `llmgw_requests_total` | counter: `operation`, `model`, `status` | Client request outcomes |
+| `llmgw_request_duration_seconds` | histogram: `operation`, `model` | End-to-end request duration, including stream and settlement |
+| `llmgw_attempts_total` | counter: `provider`, `route`, `status` | Actual provider-call outcomes, including retries |
+| `llmgw_quota_denied_total` | counter: `scope`, `reason` | Quota admission failures |
+| `llmgw_quota_reserved_tokens_total` | counter: `scope` | Tokens placed on quota hold |
+| `llmgw_quota_committed_spend_micros_total` | counter: `scope` | Settled spend |
+| `llmgw_quota_refunded_spend_micros_total` | counter: `scope` | Released spend holds |
+| `llmgw_quota_soft_spend_exceeded_total` | counter: `scope` | Soft spend threshold crossings |
+| `llmgw_quota_limit_snapshot_stale` | gauge | `1` after a PostgreSQL snapshot refresh failure; reset to `0` after success |
+
+Model labels are bounded to aliases present in the current configuration; unmatched input becomes `unknown`. Provider and route labels are configuration-controlled. This limits cardinality from arbitrary client values.
+
+Useful alerts include sustained request errors, route-specific attempt errors, nonzero stale snapshot state, settlement failures in logs, and readiness failure. Compare request and attempt counters to identify retry amplification.
+
+## Tracing hook
+
+The observer defines a small [`Tracer`](https://github.com/egor-baranov/llmgw/blob/main/observer/observer.go) interface and creates `gateway.request` and `gateway.attempt` spans with request, operation, model, provider, and route attributes. The default is a no-op tracer; there is no telemetry configuration field that automatically enables OpenTelemetry.
+
+To export traces, embed llmgw or extend application assembly with a `Tracer` implementation and assign it to `Observer.Tracer`. The core packages do not require direct OpenTelemetry imports.

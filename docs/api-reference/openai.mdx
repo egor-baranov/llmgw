@@ -1,0 +1,147 @@
+---
+title: "OpenAI-compatible API"
+description: "Use chat completions, Responses, legacy completions, and embeddings through the OpenAI-native ingress."
+---
+
+All OpenAI-compatible endpoints authenticate with:
+
+```http
+Authorization: Bearer <gateway-token>
+```
+
+The gateway validates routing/policy metadata while preserving provider-specific JSON fields. Requests route only to `openai` adapters, including configured OpenAI-compatible upstreams.
+
+## Chat completions
+
+`POST /v1/chat/completions` requires `model` and a `messages` array.
+
+```bash
+curl --silent http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [
+      {"role": "system", "content": "Answer concisely."},
+      {"role": "user", "content": "What is a reverse proxy?"}
+    ],
+    "max_completion_tokens": 200,
+    "user": "user-123"
+  }'
+```
+
+Streaming uses the same endpoint with `stream: true`:
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "messages": [{"role": "user", "content": "Count to three."}]
+  }'
+```
+
+The router inspects tool declarations, structured response formats, reasoning fields, multimodal parts, output limits, and `n` when filtering/accounting.
+
+## Responses
+
+`POST /v1/responses` requires `model` and `input`.
+
+```bash
+curl --silent http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "instructions": "Answer in one sentence.",
+    "input": "Why put policy in an LLM gateway?",
+    "max_output_tokens": 200
+  }'
+```
+
+Unary requests may use a loss-checked chat-completions bridge on an eligible chat-only route. Native and bridged candidates follow the same configured priority/weight ordering. The bridge rejects fields/content it cannot represent without loss.
+
+Native Responses streaming is supported when the selected route declares both `responses` and `streaming`:
+
+```bash
+curl -N http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "input": "Count to three.",
+    "stream": true
+  }'
+```
+
+<Warning>
+Streaming Responses cannot use the chat bridge. A chat-only route returns `unsupported_operation` for this request.
+</Warning>
+
+## Legacy completions
+
+`POST /v1/completions` requires `model` and `prompt`. `prompt` may be a string, string array, token array, or matrix of token arrays for a completions-native route.
+
+```bash
+curl --silent http://localhost:8080/v1/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "prompt": "Write one short sentence about Go.",
+    "max_tokens": 80
+  }'
+```
+
+A compatible chat-only candidate can bridge a string prompt and representable legacy fields. Text-only bridged requests may stream:
+
+```bash
+curl -N http://localhost:8080/v1/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "prompt": "Count to three:",
+    "stream": true
+  }'
+```
+
+`n` and `best_of` affect conservative output reservation. Unsupported non-text prompts/fields require a completions-native route.
+
+## Embeddings
+
+`POST /v1/embeddings` requires `model` and `input`.
+
+```bash
+curl --silent http://localhost:8080/v1/embeddings \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "text-embedding-3-small",
+    "input": ["gateway", "routing", "quota"],
+    "encoding_format": "float"
+  }'
+```
+
+`input` may be a string, array of strings, token array, or matrix of token arrays. Embeddings do not stream.
+
+## Client configuration
+
+For an OpenAI-compatible SDK, set its base URL to the gateway's `/v1` root and its API key to the llmgw token. For example, conceptually:
+
+```text
+base_url = http://localhost:8080/v1
+api_key  = <gateway-token>
+```
+
+Use a configured public model alias, not necessarily the upstream provider model. llmgw applies the selected route's `upstream_model` before dispatch.
+
+## Response behavior
+
+- Successful native calls retain the upstream JSON/SSE shape and safe response headers.
+- Bridged calls return the public endpoint's OpenAI-compatible shape.
+- Errors use the OpenAI-compatible error envelope.
+- Every response includes the gateway `X-Request-ID`.

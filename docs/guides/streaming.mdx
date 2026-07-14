@@ -1,0 +1,99 @@
+---
+title: "Streaming"
+description: "Stream provider-native SSE safely through OpenAI, Anthropic, and Gemini endpoints."
+---
+
+llmgw proxies provider-native Server-Sent Events (SSE) without normalizing them into another provider's event schema. Use `curl -N` to disable client-side buffering.
+
+## OpenAI chat streaming
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "messages": [{"role": "user", "content": "Count to three."}]
+  }'
+```
+
+OpenAI streaming Responses require a route that natively declares `responses`; the Responses-to-chat bridge is unary only.
+
+## Anthropic Messages streaming
+
+```bash
+curl -N http://localhost:8080/v1/messages \
+  -H "x-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Count to three."}]
+  }'
+```
+
+The gateway recognizes Anthropic's `message_stop` event as terminal.
+
+## Gemini streaming
+
+```bash
+curl -N \
+  http://localhost:8080/v1beta/models/gemini-2.5-flash:streamGenerateContent \
+  -H "x-goog-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Count to three."}]}
+    ]
+  }'
+```
+
+Both `/v1beta/models/...` and `/v1/models/...` forms are supported. The upstream request is made with `alt=sse`; clients do not need to add that query parameter to the gateway URL.
+
+## Legacy completions bridge
+
+Text-only OpenAI legacy completions can stream through a loss-checked chat bridge:
+
+```bash
+curl -N http://localhost:8080/v1/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "prompt": "Count to three:",
+    "stream": true
+  }'
+```
+
+If a chat chunk contains tool calls, refusals, or non-text output that cannot be represented as a legacy completion, the bridge terminates rather than silently dropping data.
+
+## Timeouts and buffering
+
+Recommended server settings:
+
+```yaml
+server:
+  write_timeout: 0s
+  stream_write_timeout: 30s
+```
+
+`write_timeout: 0s` avoids imposing one deadline on the entire response. `stream_write_timeout` is a write-idle deadline refreshed before each downstream write. Route `timeout` still bounds the upstream attempt context.
+
+Reverse proxies must disable response buffering and permit `text/event-stream`. If chunks arrive all at once, check the proxy before changing gateway code.
+
+## Fallback and first-byte behavior
+
+The gateway can retry or move to another compatible route only before response bytes are committed downstream. It validates the upstream status/content type and prefetches stream progress before handing the stream to the client. After the first downstream byte, an upstream disconnect cannot be converted into a new HTTP error response or another route.
+
+Terminal-event validation detects streams that end without the provider's completion marker. Depending on when failure occurs, the client may observe a truncated SSE response while logs and metrics record the failed attempt.
+
+## Usage and quota settlement
+
+The stream tracker watches provider events without changing their bytes and records final usage when supplied. If a provider omits usage, settlement uses the conservative route/request estimate. An aborted stream may retain estimated dimensions that were not reported, preventing a partial event from undercharging the reservation.
+
+<Note>
+Always close or cancel streaming responses in client code. The gateway settles quota when streaming completes, fails, or the client disconnects.
+</Note>

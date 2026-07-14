@@ -1,0 +1,82 @@
+---
+title: Reliability and reload
+description: Startup validation, health semantics, timeouts, retries, circuits, bounded responses, quota settlement, and safe configuration reload.
+---
+
+llmgw treats configuration, dependency state, upstream calls, downstream streaming, and quota settlement as separate failure boundaries. Admission operations fail closed when a configured shared-store control cannot be checked. Background Redis lease renewal/release and circuit outcome writes are best-effort; bounded leases limit stale capacity if that maintenance fails.
+
+## Startup is fail-fast
+
+[`app.New`](https://github.com/egor-baranov/llmgw/blob/main/app/app.go) does not bind a serving listener until it has:
+
+1. decoded YAML with unknown fields rejected and no trailing document;
+2. resolved required environment variables and validated auth, routes, capabilities, quotas, URLs, headers, and limits;
+3. matched every route to the compile-time provider registry and adapter route validation;
+4. built stores and completed startup checks, with each initialization/check phase receiving its own `store.startup_timeout` budget;
+5. created the HTTP listener.
+
+Redis performs a capability probe, not just `PING`: it verifies the writable standalone server and command/script permissions needed by rate, quota, concurrency, and breaker operations. PostgreSQL connects, ensures the quota-limit table, and loads the first immutable snapshot before startup succeeds.
+
+## Failure controls
+
+| Boundary | Control | Behavior |
+| --- | --- | --- |
+| Client body | `auth.max_body_bytes`, route `limits.max_body_bytes` | Reject before upstream dispatch |
+| Input/output model limits | capability and quota token limits | Filter or reject before upstream dispatch |
+| Route call | route `timeout` | Applied independently to every retry and retained through stream lifetime |
+| Upstream body | `limits.max_response_bytes` | Bounded read; defaults are 16 MiB for unary inference and 64 MiB for embeddings |
+| Downstream writes | `server.stream_write_timeout` | Write-idle deadline refreshed for each unary write or SSE chunk |
+| Concurrency | route and provider limits | Slot held across retries and through stream close; Redis leases are renewed |
+| Rate | route RPM and TPM | Atomically admitted together for each real upstream call |
+| Provider instability | retries, fallback, circuit breaker | Retries same route, then eligible fallback; circuit opens after qualifying failures |
+| Quota | reserve, renew, top up, commit/refund | Idempotent ticket accounts for billable retries and partial streams |
+| Shutdown | `server.shutdown_timeout` | Stops accepting new connections, drains HTTP work, then closes stores |
+
+Set the route timeout high enough for the longest expected stream. Set `server.write_timeout` to `0` for long-lived streaming; the example configuration uses the dedicated write-idle timeout instead.
+
+Response transforms are bounded again after transformation. Provider error bodies are separately capped at 1 MiB. Streaming usage parsing keeps only one bounded SSE event, and EOF without a provider terminal event is treated as a truncated upstream stream.
+
+## Retry, fallback, and accounting
+
+Retries are allowed only for retryable failures; fallback is a separate error disposition. Client cancellation stops both. Admission failures and ordinary unbillable 4xx responses do not fabricate provider usage.
+
+Quota reservation starts once per client request and is renewed while the request is active. Each actual upstream call receives an idempotent reservation top-up. Usage from billable failed retries and fallback attempts is accumulated, while duplicate completion paths are ignored. Final settlement runs on a five-second context detached from client cancellation.
+
+Monitor `settlement_failed` logs. A settlement error is surfaced after response handling but cannot retract bytes already delivered to the client.
+
+## Liveness and readiness
+
+- Use `/healthz` for liveness. It indicates that the process is serving HTTP, not that dependencies or providers are healthy.
+- Use `/readyz` for readiness. It requires a loaded snapshot and successful store health checks within two seconds.
+
+Provider APIs are intentionally not readiness dependencies. A provider outage should open route circuits and use configured fallback without causing every gateway replica to leave service discovery.
+
+## Hot reload
+
+Send `SIGHUP` to request a reload:
+
+```bash
+kill -HUP "$(pgrep -x llmgw)"
+```
+
+[`Service.Reload`](https://github.com/egor-baranov/llmgw/blob/main/app/app.go) serializes concurrent reloads, loads the same configured file path, runs structural and provider-registry validation, and only then swaps the atomic snapshot. Invalid reloads log `reload_failed` and leave the active snapshot unchanged. There is no automatic file watcher.
+
+New snapshots may change:
+
+- authentication and principal policy;
+- quota profiles and key mappings;
+- routes, upstream credentials resolved from environment, capabilities, pricing, limits, retries, and circuits.
+
+Changes to `server`, `store`, or `telemetry` are restart-only and cause reload rejection. The listener, HTTP transport, store connections, and observer were assembled at startup and are not rebuilt by reload.
+
+Every inference request is pinned to the snapshot loaded by ingress. A reload cannot mix old authentication or decoding limits with new route policy inside one request.
+
+## PostgreSQL limit refresh is separate
+
+When PostgreSQL is configured, quota limits are loaded into an immutable in-memory snapshot and refreshed every `store.limit_cache_ttl`. A failed refresh preserves the last known-good snapshot, sets the stale gauge, and logs the error. It does not replace the configuration snapshot and does not make readiness fail while a usable limit snapshot remains.
+
+Writes through the limits API update PostgreSQL and then atomically update the local limit snapshot. Other replicas observe the update on their next refresh.
+
+## Graceful shutdown
+
+`SIGINT` and `SIGTERM` trigger `http.Server.Shutdown` with `server.shutdown_timeout`, then close the listener and unique stores. Configure an orchestrator termination grace period greater than that timeout. A stream still running when the deadline expires may be terminated and settled from the usage available at that point.

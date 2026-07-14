@@ -1,0 +1,127 @@
+---
+title: Telemetry
+description: Configure service identity and operate JSON logs, Prometheus metrics, and tracing hooks.
+---
+
+llmgw emits structured JSON logs to standard output, exposes Prometheus-format metrics, and wraps requests/attempts in an internal tracer interface.
+
+```yaml
+telemetry:
+  service_name: llmgw
+```
+
+## Configuration
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `service_name` | `llmgw` when empty | Added as `service` in logs and `service.name` on trace spans. |
+
+Telemetry settings are restart-only. A reload that changes `telemetry` is rejected so a running observer cannot silently diverge from the active snapshot.
+
+There are currently no YAML fields for log level, log destination, Prometheus namespace, trace exporter, or sampling. Logs use Go’s JSON `slog` handler at info level on stdout. The default tracer is a no-op hook; an OpenTelemetry adapter can be wired in code without changing the gateway core.
+
+## Structured logs
+
+Request and attempt records include bounded operational context:
+
+```json
+{
+  "time": "2026-07-12T12:00:00Z",
+  "level": "INFO",
+  "msg": "request",
+  "service": "llmgw",
+  "request_id": "…",
+  "operation": "chat.completions",
+  "model": "fast-chat",
+  "route": "openai-primary",
+  "provider": "openai",
+  "status": "ok",
+  "duration": 125000000
+}
+```
+
+Other operational events include:
+
+- `listen` and `reloaded` lifecycle events;
+- `reload_failed`;
+- request/attempt error codes;
+- quota reservation/settlement failures;
+- soft-spend threshold warnings; and
+- PostgreSQL limit-snapshot refresh failures.
+
+Request bodies, static bearer tokens, upstream API keys, JWT secrets, and Redis/PostgreSQL credentials are not log attributes. Request-path errors and trace events record only a bounded HTTP category and error code; underlying error causes are never serialized because they can contain provider URLs or datastore connection details. Logs still expose operational metadata such as model, route, provider, and request IDs, so restrict access.
+
+## Metrics endpoint
+
+Metrics are served at `GET /metrics` in Prometheus exposition format. When authentication is enabled, the bearer/JWT principal needs `view_operations`.
+
+```bash
+curl http://127.0.0.1:8080/metrics \
+  -H "Authorization: Bearer $LLMGW_OBSERVER_TOKEN"
+```
+
+```yaml
+auth:
+  token_envs:
+    LLMGW_OBSERVER_TOKEN:
+      id: prometheus
+      permissions: [view_operations]
+```
+
+## Metric reference
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `llmgw_inflight_requests` | gauge | none | Requests currently inside the request pipeline. |
+| `llmgw_requests_total` | counter | `operation`, `model`, `status` | Completed or rejected gateway requests. Status is `ok` or `error`. |
+| `llmgw_request_duration_seconds` | histogram | `operation`, `model` | End-to-end request duration, including stream settlement. |
+| `llmgw_attempts_total` | counter | `provider`, `route`, `status` | Provider attempts, including retries and fallback calls. |
+| `llmgw_quota_denied_total` | counter | `scope`, `reason` | Quota reservation/admission failures. Current scope is `key`. |
+| `llmgw_quota_reserved_tokens_total` | counter | `scope` | Estimated tokens reserved before provider calls. |
+| `llmgw_quota_committed_spend_micros_total` | counter | `scope` | Settled spend in micro-units. |
+| `llmgw_quota_refunded_spend_micros_total` | counter | `scope` | Estimated spend released by refunds. |
+| `llmgw_quota_soft_spend_exceeded_total` | counter | `scope` | Soft-spend projected-threshold crossings. |
+| `llmgw_quota_limit_snapshot_stale` | gauge | none | `1` when the latest PostgreSQL snapshot refresh failed; `0` after success. |
+
+Model labels are bounded to aliases in the active catalog; unrecognized requested models use `unknown`. Provider and route labels come from configuration. Keep route/model names stable to make dashboards continuous across reloads.
+
+<Note>
+  The metrics registry exposes VictoriaMetrics-generated Prometheus metadata. It can be scraped by Prometheus-compatible collectors; VictoriaMetrics is not required as the storage backend.
+</Note>
+
+## Tracing hooks
+
+The request pipeline emits these logical spans when a non-noop tracer is wired:
+
+| Span | Attributes |
+| --- | --- |
+| `gateway.request` | `service.name`, `request.id`, `operation`, `model` |
+| `gateway.attempt` | `service.name`, `request.id`, `provider`, `route` |
+
+Errors are recorded on the relevant span. Streaming attempt spans end when the response stream reaches EOF, errors, or closes—not merely when the upstream headers arrive.
+
+The checked-in application constructs the no-op tracer. Exporting spans currently requires a code-level observer integration; setting an environment variable alone does not enable OTLP.
+
+## Prometheus scrape example
+
+```yaml
+scrape_configs:
+  - job_name: llmgw
+    metrics_path: /metrics
+    static_configs:
+      - targets: [llmgw:8080]
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/llmgw-metrics-token
+```
+
+Use a dedicated read-only principal with only `view_operations`, rotate its credential independently from inference clients, and restrict `/metrics` at the network layer because route/model labels reveal deployment topology.
+
+## Suggested alerts
+
+- `/readyz` is unavailable.
+- `llmgw_quota_limit_snapshot_stale == 1` for longer than one refresh interval.
+- Request or attempt error ratios increase by route/provider.
+- `rate_limit_exceeded` responses rise unexpectedly.
+- Quota settlement failure logs appear.
+- In-flight requests remain near configured route/provider concurrency ceilings.

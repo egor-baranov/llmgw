@@ -1,0 +1,116 @@
+---
+title: Provider registry
+description: How ingress descriptors and upstream adapters isolate provider behavior, and how to add a provider without central switches.
+---
+
+Provider support is compiled into the binary. llmgw does not load runtime plugins. This keeps the hot path explicit, type-checked, and easy to audit while avoiding provider-name switches in routing and policy.
+
+## The three registry layers
+
+| Layer | Contract | Owns |
+| --- | --- | --- |
+| Northbound | [`api.Ingress`](https://github.com/egor-baranov/llmgw/blob/main/api/ingress.go) | HTTP patterns, credential headers, request decoding, provider-native errors, unknown-path matching |
+| Runtime | [`gateway.Provider`](https://github.com/egor-baranov/llmgw/blob/main/gateway/gateway.go) | Name, supported canonical operations, and invocation; optional route validation, bridge, preflight, token, and effective-parameter hooks |
+| Southbound | [`proxy.Adapter`](https://github.com/egor-baranov/llmgw/blob/main/proxy/adapter.go) | Provider URLs, request/response protocol, upstream auth, usage, stream terminal events, and transformations |
+
+One compile-time binding list in [`api/ingress.go`](https://github.com/egor-baranov/llmgw/blob/main/api/ingress.go) pairs every built-in ingress factory with its adapter factory. `api.DefaultIngresses` and `api.DefaultProviders` derive fresh aligned registries from that single source, and `app` consumes them during service assembly. [`gateway.ValidateProviders`](https://github.com/egor-baranov/llmgw/blob/main/gateway/providers.go) then verifies that every configured route references exactly one registered provider, advertises only supported operations, and passes adapter-owned route validation.
+
+Validation runs both at startup and before a hot reload is accepted.
+
+## Built-in behavior
+
+| Provider name | Upstream operations | Native northbound surface |
+| --- | --- | --- |
+| `openai` | Chat Completions, Responses, Completions, Embeddings | `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/embeddings` |
+| `anthropic` | Messages represented canonically as `chat.completions` | `/v1/messages` |
+| `gemini` | Generate Content and Embed Content | `/v1` and `/v1beta` model-operation paths |
+
+The operation matrix comes from each adapter's `Operations` map, not from configuration code. Route capabilities may advertise a subset, but cannot claim an operation absent from the registered adapter.
+
+## Reuse the OpenAI adapter when possible
+
+Do not create a new provider merely because an upstream has a different hostname. If it is OpenAI-compatible, configure an `openai` route with a custom `base_url` and, when needed, `upstream_model`. You keep the existing ingress, validation, streaming, usage, and error behavior.
+
+A new native adapter is appropriate when authentication, URLs, bodies, errors, usage, or SSE terminal semantics materially differ.
+
+## Add a native provider
+
+### 1. Add request decoding
+
+Create a focused decoder in [`proxy/providers`](https://github.com/egor-baranov/llmgw/tree/main/proxy/providers). It should:
+
+- validate the provider-native request shape and body limit;
+- preserve the original JSON in `Request.RawBody`;
+- fill the public model, stream flag, normalized user/metadata, output-token limit, prompt/token hints, and required capabilities;
+- return `gateway.APIError` values suitable for the ingress error writer.
+
+Avoid provider decisions in `policy`; normalized hints are its contract.
+
+### 2. Define the ingress
+
+Add `api/ingress_<provider>.go` returning an `api.Ingress`. Declare exact methods and paths, authenticate before decoding, and write the provider's public error envelope. Dynamic model-operation paths can use `IngressRoute.Resolve`.
+
+Set `Fallback` only for the one protocol that should format otherwise-unmatched paths; OpenAI currently owns that role. Registration happens after the adapter exists so the two factories can be added together.
+
+Even when reusing an existing decoder and public error shape, register an ingress descriptor whose `Provider` matches the new adapter. The current router pins candidates to that ingress provider and does not perform arbitrary cross-provider request translation.
+
+### 3. Define the adapter
+
+Create `proxy/adapter_<provider>.go` inside `package proxy` and return a fresh [`Adapter`](https://github.com/egor-baranov/llmgw/blob/main/proxy/adapter.go). A minimal shape is:
+
+```go
+func AcmeAdapter() Adapter {
+    return Adapter{
+        Name: "acme",
+        Operations: map[gateway.Operation]OperationAdapter{
+            gateway.OpChatCompletions: {
+                Prepare:          prepareAcmeChat,
+                ValidateResponse: validateAcmeChat,
+            },
+        },
+        ApplyAuth:     applyAcmeAuth,
+        ParseError:    parseAcmeError,
+        ExtractUsage:  extractAcmeUsage,
+        ValidateRoute: validateAcmeRoute,
+        Stream: StreamCodec{
+            Usage:    acmeStreamUsage,
+            Terminal: acmeStreamTerminal,
+        },
+    }
+}
+```
+
+Use the optional hooks only when the protocol needs them:
+
+- `ForwardHeaders` for a small allowlist of safe client headers;
+- `Preflight` for deterministic body-level incompatibility;
+- `PlanBridge` plus response/stream transforms for a lossless compatibility path;
+- `ProjectTokenText` to remove inline binary payloads before local tokenization;
+- `TransformResponse` when the public and upstream wire shapes differ.
+
+The generic runtime already handles HTTP transport, redirect refusal, response limits, usage fallback, safe response headers, and stream tracking.
+
+### 4. Register the built-in pair
+
+Add one entry to `builtInProtocolBindings` in `api/ingress.go`:
+
+```go
+{newIngress: AcmeIngress, newAdapter: proxy.AcmeAdapter},
+```
+
+`api.DefaultIngresses` and `api.DefaultProviders` are both derived from this list. Do not add another name-based adapter map or an app-local provider list. For custom embedding that is not a checked-in built-in, pass the `api.Ingress` values to `api.NewServerWithIngresses` and wrap adapters explicitly with `proxy.NewProvider`.
+
+Then configure at least one route whose lowercase `provider` exactly matches both `Ingress.Provider` and `Adapter.Name`.
+
+### 5. Test the boundaries
+
+At minimum, cover:
+
+- ingress authentication, request decoding, error shape, method handling, and unknown paths;
+- adapter request URL/body/auth, unary validation, usage and error parsing;
+- stream usage and terminal detection, including truncated streams;
+- route validation and operation mismatch rejection;
+- router capability filtering, preflight, retry/fallback disposition, and any bridge;
+- one end-to-end request through the assembled server.
+
+The registry should make a useful assertion possible: a fake provider can load, validate, and execute without editing a gateway routing switch.

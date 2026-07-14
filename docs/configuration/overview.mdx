@@ -1,0 +1,124 @@
+---
+title: Configuration overview
+description: How llmgw loads, validates, and applies its YAML configuration.
+---
+
+llmgw is configured from one YAML file. The file defines the HTTP server, gateway credentials, state stores, key quotas, provider routes, and telemetry identity.
+
+```bash
+go run ./cmd/llmgw -config ./config/config.example.yaml
+```
+
+The default path is `config/config.example.yaml`. Use `-config` to select another file. There is no implicit `.env` loader and no general-purpose `${VAR}` interpolation; secrets are read only through the explicit `*_env` fields described in [Environment variables](/configuration/environment-variables).
+
+<Note>
+  Configuration is strict. Unknown YAML keys, malformed durations, multiple YAML documents, invalid cross-references, and unavailable required environment variables stop startup before the listener begins accepting traffic.
+</Note>
+
+## Top-level structure
+
+```yaml
+server:       # listener and HTTP timeouts
+auth:         # anonymous mode, static bearer credentials, JWT, identity requirements
+store:        # memory/Redis runtime state and optional PostgreSQL quota limits
+telemetry:    # service identity for JSON logs and traces
+quota:        # file-backed quota profiles and key-to-profile assignments
+routes:       # public model aliases and provider upstreams
+```
+
+| Section | Required? | Purpose |
+| --- | --- | --- |
+| `server` | No | Listener address and connection, stream, and shutdown deadlines. Missing values receive defaults. |
+| `auth` | Yes in practice | Configure credentials or explicitly set `allow_anonymous: true`. Secure-by-default startup rejects an otherwise empty auth section. |
+| `store` | No | Defaults to process-local memory. Redis shares hot-path state; PostgreSQL persists dynamic limit definitions. |
+| `telemetry` | No | Sets the service name. An empty name becomes `llmgw`. |
+| `quota` | No | Defines optional static key-scoped quota profiles. |
+| `routes` | Yes | At least one non-null route is required. |
+
+## Minimal local configuration
+
+This is the smallest useful anonymous configuration for a local OpenAI-compatible upstream:
+
+```yaml
+auth:
+  allow_anonymous: true
+
+routes:
+  local-chat:
+    provider: openai
+    model: local-chat
+    upstream_model: llama3.1:8b
+    base_url: http://127.0.0.1:11434/v1
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      max_input_tokens: 32768
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
+```
+
+Defaults fill in `server.listen`, server timeouts, the memory store, route weight and timeout, and circuit-breaker settings. A generative route must still declare a positive `capabilities.max_output_tokens`, and every route must declare at least one operation and a supported tokenizer.
+
+<Warning>
+  Anonymous mode is intended for isolated local development. It also permits unauthenticated access to operational endpoints such as `/metrics`, `/openapi.yaml`, and `/docs/`.
+</Warning>
+
+## Configuration lifecycle
+
+<Steps>
+  <Step title="Decode strictly">
+    llmgw accepts exactly one YAML document and rejects keys that do not map to a known field.
+  </Step>
+  <Step title="Resolve explicit environment references">
+    `token_envs` and fields ending in `_env` are looked up. Missing or empty values fail loading.
+  </Step>
+  <Step title="Apply defaults and validate structure">
+    The loader normalizes provider names, route backends, tokenizers, and store mode; applies defaults; validates values; and resolves cross-references.
+  </Step>
+  <Step title="Bind routes to compiled providers">
+    Application startup verifies every configured provider and operation against the compiled adapter registry and invokes provider-native route validation.
+  </Step>
+  <Step title="Check dependencies">
+    Redis and PostgreSQL are checked during startup within `store.startup_timeout`. Redis receives a write/script capability probe.
+  </Step>
+  <Step title="Publish the snapshot">
+    A successful snapshot is used by new requests. On `SIGHUP`, reloadable sections are atomically replaced only after configuration and provider-registry checks pass. Live dependency assembly and capability probes remain startup-only because store settings are restart-only.
+  </Step>
+</Steps>
+
+See [Reload and validation](/configuration/reload-and-validation) for restart-only fields and failure behavior.
+
+## Zero-value convention
+
+Most numeric limits use `0` to mean “disabled” or “unlimited.” A few fields instead receive a non-zero default when omitted or set to zero. The relevant page calls out each exception. In particular:
+
+| Field | Effective value when zero |
+| --- | --- |
+| `server.listen` | `:8080` when empty |
+| `server.read_timeout` | `15s` |
+| `server.stream_write_timeout` | `30s` |
+| `server.idle_timeout` | `60s` |
+| `server.shutdown_timeout` | `10s` |
+| `server.write_timeout` | Remains `0s` (disabled) |
+| `auth.max_body_bytes` | `4194304` (4 MiB) |
+| `store.mode` | `memory` |
+| `store.quota_table` | `quota_limits` |
+| `store.limit_cache_ttl` | `30s` |
+| `store.reservation_ttl` | `10m` |
+| `store.startup_timeout` | `10s` |
+| `routes.<name>.weight` | `1` |
+| `routes.<name>.timeout` | `30s` |
+| `routes.<name>.circuit.failures` | `3` |
+| `routes.<name>.circuit.cooldown` | `30s` |
+| Vision/audio token surcharge | `1024` / `8192` when the capability is enabled |
+
+All duration values use Go duration syntax such as `250ms`, `30s`, `10m`, or `24h`.
+
+## Where to go next
+
+- Configure the listener in [Server](/configuration/server).
+- Choose credentials and identity rules in [Authentication](/configuration/authentication).
+- Add model aliases and upstreams in [Routes](/configuration/routes).
+- Make routing claims accurate with [Capabilities and pricing](/configuration/capabilities-and-pricing).
+- Define governance in [Quotas and limits](/configuration/quotas-and-limits).
+- Choose process-local or shared state in [Storage](/configuration/storage).

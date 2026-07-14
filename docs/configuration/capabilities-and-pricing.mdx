@@ -1,0 +1,161 @@
+---
+title: Capabilities and pricing
+description: Declare route features accurately and configure token, cache, and hosted-tool pricing for quota accounting.
+---
+
+Capabilities are routing promises, not informational labels. llmgw rejects or skips a route before the upstream call when the decoded request requires a feature the route does not advertise. Pricing converts estimated and reported usage into micro-units for spend governance.
+
+## Capability fields
+
+```yaml
+capabilities:
+  operations: [chat.completions, responses]
+  streaming: true
+  tool_calling: true
+  structured_output: true
+  vision_input: true
+  vision_input_token_surcharge: 1024
+  audio: false
+  reasoning: false
+  max_input_tokens: 128000
+  max_output_tokens: 16384
+  tokenizer: o200k_base
+```
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `operations` | operation array | required | Operations the route executes natively. At least one unique known value is required. |
+| `streaming` | boolean | `false` | Allows requests with streaming enabled. |
+| `tool_calling` | boolean | `false` | Allows requests containing tools or equivalent provider-native tool declarations. |
+| `structured_output` | boolean | `false` | Allows JSON schema or other structured-output requests. |
+| `vision_input` | boolean | `false` | Allows image input. |
+| `audio` | boolean | `false` | Allows audio input. |
+| `reasoning` | boolean | `false` | Allows provider-native reasoning/thinking parameters. |
+| `max_input_tokens` | integer | `0` | Candidate input-token ceiling. Zero disables this ceiling. |
+| `max_output_tokens` | integer | `0` | Candidate output-token ceiling. Must be positive for generative operations. |
+| `tokenizer` | string | required | Tokenizer family used for pre-call estimation. |
+| `vision_input_token_surcharge` | integer | `1024` when vision is enabled | Extra estimated input tokens per decoded image part. Must be zero unless `vision_input` is true. |
+| `audio_input_token_surcharge` | integer | `8192` when audio is enabled | Extra estimated input tokens per decoded audio part. Must be zero unless `audio` is true. |
+
+Supported operation values are:
+
+- `chat.completions`
+- `responses`
+- `completions`
+- `embeddings`
+
+The compiled provider must support every advertised operation. The built-in operation matrix is:
+
+| Provider | `chat.completions` | `responses` | `completions` | `embeddings` |
+| --- | --- | --- | --- | --- |
+| `openai` | Yes | Yes | Yes | Yes |
+| `anthropic` | Yes | No | No | No |
+| `gemini` | Yes | No | No | Yes |
+
+<Note>
+  OpenAI-compatible routing can bridge eligible Responses and legacy Completions requests through a route that advertises `chat.completions`. The bridge is a compatibility path; it does not change the operations the route natively advertises, and streaming Responses cannot use it.
+</Note>
+
+## Tokenizer families
+
+| Value | Estimator |
+| --- | --- |
+| `o200k_base` | Native `o200k_base` encoding. |
+| `cl100k_base` | Native `cl100k_base` encoding. |
+| `p50k_base` | Native `p50k_base` encoding. |
+| `p50k_edit` | Native `p50k_edit` encoding. |
+| `r50k_base` | Native `r50k_base` encoding. |
+| `claude` | `cl100k_base` approximation plus a 25% safety margin. |
+| `gemini` | `cl100k_base` approximation plus a 25% safety margin. |
+
+Provider adapters remove inline binary payloads from tokenizable text before estimation. Image and audio parts are then charged with the configured per-part surcharge. This avoids counting base64 bytes as ordinary text while still reserving quota conservatively.
+
+If a request does not specify an output maximum, llmgw reserves the route’s `max_output_tokens`. This is why a realistic positive maximum is mandatory for chat, Responses, and Completions routes.
+
+## Pricing fields
+
+```yaml
+pricing:
+  input_per_1m: 0.15
+  output_per_1m: 0.60
+  cache_read_per_1m: 0.075
+  cache_write_per_1m: 0.1875
+  provider_units:
+    web_search_requests:
+      micros_per_unit: 10000
+      max_units_per_request: 1
+```
+
+| Field | Unit | Default | Description |
+| --- | --- | --- | --- |
+| `input_per_1m` | currency units per 1M tokens | `0` | Ordinary uncached input price. |
+| `output_per_1m` | currency units per 1M tokens | `0` | Output price. |
+| `cache_read_per_1m` | currency units per 1M tokens | `input_per_1m` | Cached-input read price. Zero falls back to the ordinary input rate. |
+| `cache_write_per_1m` | currency units per 1M tokens | `input_per_1m` | Prompt-cache creation price. Zero falls back to the ordinary input rate. |
+| `provider_units.<name>.micros_per_unit` | micro-units per event | `0` | Price for one hosted-tool or provider-metered event. |
+| `provider_units.<name>.max_units_per_request` | events | `0` | Worst-case pre-call reservation for an enabled unit. |
+
+All prices must be finite and non-negative. Unit names must be non-empty and per-request maxima must be non-negative.
+
+### Currency convention
+
+llmgw stores spend as integer micro-units. If route prices are in US dollars, then one micro-unit is one micro-dollar and `1_000_000` micros is `$1.00`.
+
+For token usage, the configured “per 1M” rate intentionally cancels the micro conversion:
+
+```text
+spend_micros = ceil(tokens × price_per_1m)
+```
+
+Each provider invocation is rounded up separately so a series of retries cannot evade a spend limit through sub-micro amounts. Retries and fallbacks are accumulated as separate billable attempts.
+
+### Cache pricing
+
+Reported cached tokens are bounded by reported input tokens. Cache reads are priced first, then cache writes, then remaining input at `input_per_1m`. When either cache-specific rate is zero, llmgw uses `input_per_1m` so omitted optimization pricing never makes cached input free.
+
+Anthropic cache read and cache creation usage is included in billable input. A request that enables an ephemeral prompt-cache write reserves its full estimated input as potential cache-write tokens before dispatch.
+
+### Provider-metered units
+
+The built-in decoders recognize these request units:
+
+| Provider | Recognized unit names |
+| --- | --- |
+| OpenAI-compatible | `web_search_requests`, `file_search_requests`, `computer_use_requests`, `code_interpreter_requests`, `image_generation_requests` |
+| Anthropic | `web_search_requests` |
+| Gemini | `google_search_requests` |
+
+If a key has `max_spend_micros`, every provider unit enabled by the request must have both positive `micros_per_unit` and positive `max_units_per_request` on the candidate route. Otherwise the route is rejected before dispatch because a hard upper-bound reservation cannot be calculated.
+
+```yaml
+pricing:
+  input_per_1m: 3.00
+  output_per_1m: 15.00
+  provider_units:
+    web_search_requests:
+      micros_per_unit: 10000
+      max_units_per_request: 1
+```
+
+At settlement, actual provider-reported unit counts replace the worst-case reservation for a completed response. For a partial or aborted stream, missing dimensions remain conservatively reserved.
+
+## Missing pricing
+
+Pricing is optional and zero values do not block ordinary requests. They do matter when enforcing a hard spend quota:
+
+- token usage without configured token prices contributes zero spend;
+- hosted tools without complete bounded unit pricing make a hard-spend route ineligible; and
+- `soft_spend_micros` can only signal based on spend llmgw can calculate.
+
+For reliable spend governance, configure all token, cache, and provider-unit prices that the upstream can report or the route can enable.
+
+## Capability checklist
+
+Before enabling a route, verify:
+
+- every advertised operation works at its `base_url`;
+- `streaming` reflects the specific operation, not just the provider in general;
+- tool, schema, vision, audio, and reasoning flags match the selected upstream model;
+- input/output maxima are model-specific and current;
+- the tokenizer and multimodal surcharges are conservative; and
+- pricing covers cache behavior and hosted tools used by clients.

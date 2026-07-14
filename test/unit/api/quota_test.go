@@ -19,7 +19,7 @@ import (
 
 func TestQuotaLimitsMethodNotAllowed(t *testing.T) {
 	rr := httptest.NewRecorder()
-	req := quotaRequest(t, http.MethodPost, "/v1/limits", "", signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	req := quotaRequest(t, http.MethodPost, "/v1/limits", "", signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss":    "llmgw-tests",
 		"aud":    "gateway",
 		"sub":    "principal-1",
@@ -37,9 +37,9 @@ func TestQuotaLimitsMethodNotAllowed(t *testing.T) {
 	assertErrorCode(t, rr.Body.String(), "method_not_allowed")
 }
 
-func TestQuotaLimitsGetPropagatesLookupFailure(t *testing.T) {
+func TestQuotaLimitsGetClassifiesLookupStoreFailure(t *testing.T) {
 	rr := httptest.NewRecorder()
-	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss":    "llmgw-tests",
 		"aud":    "gateway",
 		"sub":    "principal-1",
@@ -48,15 +48,18 @@ func TestQuotaLimitsGetPropagatesLookupFailure(t *testing.T) {
 
 	newQuotaServer(&quotaLimitStub{getErr: errors.New("boom")}, nil).Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
 	}
-	assertErrorCode(t, rr.Body.String(), "quota_limit_lookup_failed")
+	assertErrorCode(t, rr.Body.String(), "quota_limit_store_unavailable")
+	if strings.Contains(rr.Body.String(), "boom") {
+		t.Fatalf("response exposed backend error: %s", rr.Body.String())
+	}
 }
 
-func TestQuotaLimitsGetPropagatesUsageFailure(t *testing.T) {
+func TestQuotaLimitsGetReportsUnavailableUsage(t *testing.T) {
 	rr := httptest.NewRecorder()
-	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss":    "llmgw-tests",
 		"aud":    "gateway",
 		"sub":    "principal-1",
@@ -67,32 +70,144 @@ func TestQuotaLimitsGetPropagatesUsageFailure(t *testing.T) {
 		"key-1": {RPM: 10},
 	}}, &quotaUsageStub{err: errors.New("boom")}).Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
 	}
-	assertErrorCode(t, rr.Body.String(), "quota_usage_lookup_failed")
+	var payload struct {
+		UsageUnavailable bool `json:"usage_unavailable"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !payload.UsageUnavailable {
+		t.Fatalf("usage_unavailable = false, want true: %s", rr.Body.String())
+	}
 }
 
-func TestQuotaLimitsPutPropagatesWriteFailure(t *testing.T) {
+func TestQuotaLimitsPutClassifiesWriteStoreFailure(t *testing.T) {
 	rr := httptest.NewRecorder()
-	req := quotaRequest(t, http.MethodPut, "/v1/limits", `{"rpm":10}`, signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	req := quotaRequest(t, http.MethodPut, "/v1/limits", `{"rpm":10}`, signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "principal-1",
+		"key_id":      "key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
+	}))
+
+	newQuotaServer(&quotaLimitStub{putErr: errors.New("boom")}, nil).Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+	assertErrorCode(t, rr.Body.String(), "quota_limit_store_unavailable")
+	if strings.Contains(rr.Body.String(), "boom") {
+		t.Fatalf("response exposed backend error: %s", rr.Body.String())
+	}
+}
+
+func TestQuotaLimitsPutReportsUnavailableUsage(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := quotaRequest(t, http.MethodPut, "/v1/limits", `{"rpm":10}`, signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "principal-1",
+		"key_id":      "key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
+	}))
+
+	newQuotaServer(&quotaLimitStub{}, &quotaUsageStub{err: errors.New("boom")}).Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var payload struct {
+		UsageUnavailable bool `json:"usage_unavailable"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !payload.UsageUnavailable {
+		t.Fatalf("usage_unavailable = false, want true: %s", rr.Body.String())
+	}
+}
+
+func TestQuotaLimitsPutRequiresManageLimitsPermission(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := quotaRequest(t, http.MethodPut, "/v1/limits", `{"rpm":10}`, signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss":    "llmgw-tests",
 		"aud":    "gateway",
 		"sub":    "principal-1",
 		"key_id": "key-1",
 	}))
 
-	newQuotaServer(&quotaLimitStub{putErr: errors.New("boom")}, nil).Handler().ServeHTTP(rr, req)
+	newQuotaServer(&quotaLimitStub{}, nil).Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusForbidden)
 	}
-	assertErrorCode(t, rr.Body.String(), "quota_limit_write_failed")
+	assertErrorCode(t, rr.Body.String(), "permission_denied")
+}
+
+func TestQuotaLimitsPutStrictAndBoundedJSON(t *testing.T) {
+	claims := jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "principal-1",
+		"key_id":      "key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
+	}
+	tests := []struct {
+		name     string
+		body     string
+		maxBytes int64
+		status   int
+		code     string
+	}{
+		{name: "unknown field", body: `{"rpm":10,"unknown":true}`, status: http.StatusBadRequest, code: "invalid_json"},
+		{name: "trailing value", body: `{"rpm":10}{}`, status: http.StatusBadRequest, code: "invalid_json"},
+		{name: "too large", body: `{"rpm":10}`, maxBytes: 8, status: http.StatusRequestEntityTooLarge, code: "body_too_large"},
+		{name: "soft exceeds hard spend", body: `{"max_spend_micros":10,"soft_spend_micros":11}`, status: http.StatusBadRequest, code: "invalid_limit"},
+		{name: "unknown provider", body: `{"provider_allowlist":["unknown"]}`, status: http.StatusBadRequest, code: "invalid_limit"},
+		{name: "unsafe distributed integer", body: `{"max_spend_micros":100000000000000}`, status: http.StatusBadRequest, code: "invalid_limit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newQuotaServer(&quotaLimitStub{}, nil)
+			if tt.maxBytes > 0 {
+				srv.Config.Load().Auth.MaxBodyBytes = tt.maxBytes
+			}
+			rr := httptest.NewRecorder()
+			req := quotaRequest(t, http.MethodPut, "/v1/limits", tt.body, signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", claims))
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != tt.status {
+				t.Fatalf("status = %d, want %d: %s", rr.Code, tt.status, rr.Body.String())
+			}
+			assertErrorCode(t, rr.Body.String(), tt.code)
+		})
+	}
+}
+
+func TestQuotaLimitsPutAllowsProviderPresentInSnapshotRoutes(t *testing.T) {
+	claims := jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "principal-1",
+		"key_id":      "key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
+	}
+	rr := httptest.NewRecorder()
+	req := quotaRequest(t, http.MethodPut, "/v1/limits", `{"provider_allowlist":["openai"]}`, signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", claims))
+
+	newQuotaServer(&quotaLimitStub{}, nil).Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
 }
 
 func TestQuotaLimitsGetReturnsNotFoundWithoutConfiguredLimits(t *testing.T) {
 	rr := httptest.NewRecorder()
-	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	req := quotaRequest(t, http.MethodGet, "/v1/limits", "", signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss":    "llmgw-tests",
 		"aud":    "gateway",
 		"sub":    "principal-1",
@@ -116,8 +231,11 @@ func newQuotaServer(limits store.QuotaLimitStore, usage store.QuotaUsageStore) *
 					Algorithm: "HS256",
 					Issuer:    "llmgw-tests",
 					Audience:  "gateway",
-					Secret:    "test-secret",
+					Secret:    "test-secret-that-is-at-least-32-bytes",
 				},
+			},
+			Routes: map[string]*gateway.Route{
+				"openai": {Provider: "openai"},
 			},
 		}),
 		nil,

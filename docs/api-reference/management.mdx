@@ -1,0 +1,153 @@
+---
+title: "Discovery and operations API"
+description: "Reference for models, limits, health, readiness, metrics, OpenAPI, and Swagger UI."
+---
+
+## List models
+
+```text
+GET /v1/models
+```
+
+```bash
+curl --silent http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "gpt-4o-mini", "object": "model", "owned_by": "llmgw"}
+  ]
+}
+```
+
+The list contains unique public aliases visible through at least one route after applying the principal's model/provider ACL and quota allowlists. It does not query upstream model-list APIs.
+
+## Get limits
+
+```text
+GET /v1/limits
+```
+
+Requires bearer authentication and a principal that resolves to a quota key (`key_id`, `quota_key`, or the stable identity fallback).
+
+```bash
+curl --silent http://localhost:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+```json
+{
+  "key_id": "dev-key",
+  "source": "config",
+  "limits": {
+    "max_parallel": 32,
+    "daily_tokens": 1000000
+  },
+  "usage": {
+    "rpm_current": 2,
+    "tpm_current": 800,
+    "daily_used_tokens": 4200
+  }
+}
+```
+
+`source` is `dynamic` when a stored override takes precedence. `usage_unavailable: true` may be returned with `200` if policy is readable but live counters are temporarily unavailable.
+
+## Put limits
+
+```text
+PUT /v1/limits
+```
+
+Requires bearer authentication, a resolved quota key, and `manage_limits`. It replaces the complete dynamic definition for the caller's own key.
+
+```bash
+curl --silent --request PUT http://localhost:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rpm": 120,
+    "tpm": 500000,
+    "max_parallel": 8,
+    "max_spend_micros": 10000000,
+    "soft_spend_micros": 8000000,
+    "daily_tokens": 2000000,
+    "monthly_tokens": 40000000,
+    "budget_duration": "720h",
+    "max_input_tokens": 128000,
+    "max_output_tokens": 8192,
+    "model_allowlist": ["gpt-4o-mini"],
+    "provider_allowlist": ["openai"]
+  }'
+```
+
+All fields are optional; zero disables the corresponding numeric limit. Unknown fields and negative values are rejected. `provider_allowlist` values must correspond to providers with configured routes.
+
+## Liveness
+
+```text
+GET /healthz
+```
+
+Public endpoint:
+
+```json
+{"ok":true}
+```
+
+`200` means the process can serve HTTP. It does not check Redis/PostgreSQL health.
+
+## Readiness
+
+```text
+GET /readyz
+```
+
+Public endpoint. Success:
+
+```json
+{"ready":true}
+```
+
+Returns `503` when configuration is absent or a required state dependency fails its bounded readiness check.
+
+## Metrics
+
+```text
+GET /metrics
+```
+
+Returns Prometheus text format. When authentication is enabled, use a bearer principal with `view_operations`:
+
+```bash
+curl --silent http://localhost:8080/metrics \
+  -H "Authorization: Bearer $LLMGW_OPERATIONS_TOKEN"
+```
+
+## Generated OpenAPI
+
+```text
+GET /openapi.json
+GET /openapi.yaml
+```
+
+These documents are generated from the running snapshot and include configured model aliases. Both require `view_operations` unless anonymous mode is enabled.
+
+```bash
+curl --silent http://localhost:8080/openapi.json \
+  -H "Authorization: Bearer $LLMGW_OPERATIONS_TOKEN"
+```
+
+## Swagger UI
+
+```text
+GET /docs
+GET /docs/*
+```
+
+`/docs` redirects permanently to `/docs/index.html`. Swagger UI loads `/openapi.json`, expands operations as a list, supports deep links, and persists authorization entered in the UI.
+
+The initial UI and spec requests are themselves protected by `view_operations`. Use an authenticated reverse proxy/browser setup, or anonymous mode on a local-only instance.

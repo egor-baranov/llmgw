@@ -3,18 +3,20 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
-	"strings"
 
 	"llmgw/gateway"
-	"llmgw/policy"
 )
 
 type limitsResponse struct {
-	KeyID  string              `json:"key_id"`
-	Source string              `json:"source"`
-	Limits gateway.LimitSpec   `json:"limits"`
-	Usage  *gateway.QuotaUsage `json:"usage,omitempty"`
+	KeyID            string              `json:"key_id"`
+	Source           string              `json:"source"`
+	Limits           gateway.LimitSpec   `json:"limits"`
+	Usage            *gateway.QuotaUsage `json:"usage,omitempty"`
+	UsageUnavailable bool                `json:"usage_unavailable,omitempty"`
 }
 
 func (s *Server) limits() http.HandlerFunc {
@@ -32,13 +34,14 @@ func (s *Server) limits() http.HandlerFunc {
 }
 
 func (s *Server) getLimits(w http.ResponseWriter, r *http.Request) {
-	cfg, subject, err := s.authenticateLimitsRequest(r)
+	cfg, _, subject, err := s.authenticateLimitsRequest(r)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	scope, source, found, err := s.resolveLimitsScope(r.Context(), cfg, subject)
 	if err != nil {
+		s.logInternalError(r, "quota_limit_lookup_failed", err)
 		writeError(w, err)
 		return
 	}
@@ -54,10 +57,12 @@ func (s *Server) getLimits(w http.ResponseWriter, r *http.Request) {
 	if s.QuotaUsage != nil {
 		usage, err := s.QuotaUsage.GetUsage(r.Context(), scope)
 		if err != nil {
-			writeError(w, gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_usage_lookup_failed", err))
-			return
+			wrapped := gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_usage_lookup_failed", err)
+			s.logInternalError(r, "quota_usage_lookup_failed", wrapped)
+			resp.UsageUnavailable = true
+		} else {
+			resp.Usage = &usage
 		}
-		resp.Usage = &usage
 	}
 	_ = writeJSON(w, http.StatusOK, resp)
 }
@@ -67,23 +72,43 @@ func (s *Server) putLimits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, gateway.NewError(http.StatusServiceUnavailable, "server_error", "quota_limit_store_unavailable", "dynamic quota limit store is not configured"))
 		return
 	}
-	_, subject, err := s.authenticateLimitsRequest(r)
+	cfg, principal, subject, err := s.authenticateLimitsRequest(r)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	defer r.Body.Close()
-	var limit gateway.LimitSpec
-	if err := json.NewDecoder(r.Body).Decode(&limit); err != nil {
-		writeError(w, gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error()))
+	if !principal.HasPermission(gateway.PermissionManageLimits) {
+		writeError(w, gateway.NewError(http.StatusForbidden, "invalid_request_error", "permission_denied", "manage_limits permission is required"))
 		return
 	}
-	if err := validateLimitSpec(limit); err != nil {
+	defer r.Body.Close()
+	maxBytes := cfg.Auth.MaxBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = 4 << 20
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
+	decoder.DisallowUnknownFields()
+	var limit gateway.LimitSpec
+	if err := decoder.Decode(&limit); err != nil {
+		writeError(w, quotaJSONError(err))
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON object")
+		}
+		writeError(w, quotaJSONError(err))
+		return
+	}
+	if err := validateLimitSpec(cfg, limit); err != nil {
 		writeError(w, err)
 		return
 	}
 	if err := s.Limits.Put(r.Context(), subject.KeyID, limit); err != nil {
-		writeError(w, gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_limit_write_failed", err))
+		wrapped := quotaLimitStoreError(r.Context(), err)
+		s.logInternalError(r, "quota_limit_write_failed", wrapped)
+		writeError(w, wrapped)
 		return
 	}
 	resp := limitsResponse{
@@ -97,40 +122,45 @@ func (s *Server) putLimits(w http.ResponseWriter, r *http.Request) {
 			Limits: limit,
 		})
 		if err != nil {
-			writeError(w, gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_usage_lookup_failed", err))
-			return
+			wrapped := gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_usage_lookup_failed", err)
+			s.logInternalError(r, "quota_usage_lookup_failed", wrapped)
+			resp.UsageUnavailable = true
+		} else {
+			resp.Usage = &usage
 		}
-		resp.Usage = &usage
 	}
 	_ = writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) authenticateLimitsRequest(r *http.Request) (*gateway.Snapshot, gateway.Subject, error) {
+func quotaJSONError(err error) error {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return gateway.NewError(http.StatusRequestEntityTooLarge, "invalid_request_error", "body_too_large", "request body exceeds configured maximum")
+	}
+	return gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
+}
+
+func (s *Server) authenticateLimitsRequest(r *http.Request) (*gateway.Snapshot, *gateway.Principal, gateway.Subject, error) {
 	cfg := s.Config.Load()
 	if cfg == nil {
-		return nil, gateway.Subject{}, gateway.NewError(http.StatusServiceUnavailable, "server_error", "not_ready", "configuration not loaded")
+		return nil, nil, gateway.Subject{}, gateway.NewError(http.StatusServiceUnavailable, "server_error", "not_ready", "configuration not loaded")
 	}
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	parts := strings.SplitN(auth, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || strings.TrimSpace(parts[1]) == "" {
-		return nil, gateway.Subject{}, gateway.Unauthorized("missing bearer token")
-	}
-	principal, err := policy.AuthenticatePrincipal(cfg, strings.TrimSpace(parts[1]))
+	principal, err := authenticateBearerRequest(cfg, r, false)
 	if err != nil {
-		return nil, gateway.Subject{}, err
+		return nil, nil, gateway.Subject{}, err
 	}
 	subject := principal.Subject()
 	if subject.KeyID == "" {
-		return nil, gateway.Subject{}, gateway.NewError(http.StatusBadRequest, "invalid_request_error", "missing_key_id", "authenticated token did not resolve to a quota key id")
+		return nil, nil, gateway.Subject{}, gateway.NewError(http.StatusBadRequest, "invalid_request_error", "missing_key_id", "authenticated token did not resolve to a quota key id")
 	}
-	return cfg, subject, nil
+	return cfg, principal, subject, nil
 }
 
 func (s *Server) resolveLimitsScope(ctx context.Context, cfg *gateway.Snapshot, subject gateway.Subject) (gateway.ScopedLimit, string, bool, error) {
 	if s.Limits != nil {
 		limit, ok, err := s.Limits.Get(ctx, subject.KeyID)
 		if err != nil {
-			return gateway.ScopedLimit{}, "", false, gateway.WrapError(http.StatusInternalServerError, "server_error", "quota_limit_lookup_failed", err)
+			return gateway.ScopedLimit{}, "", false, quotaLimitStoreError(ctx, err)
 		}
 		if ok {
 			return gateway.ScopedLimit{
@@ -146,27 +176,37 @@ func (s *Server) resolveLimitsScope(ctx context.Context, cfg *gateway.Snapshot, 
 	return scopes[0], "config", true, nil
 }
 
-func validateLimitSpec(limit gateway.LimitSpec) error {
-	for _, field := range []struct {
-		value int64
-		name  string
-	}{
-		{limit.RPM, "rpm"},
-		{limit.TPM, "tpm"},
-		{limit.MaxParallel, "max_parallel"},
-		{limit.MaxSpendMicros, "max_spend_micros"},
-		{limit.SoftSpendMicros, "soft_spend_micros"},
-		{limit.DailyTokens, "daily_tokens"},
-		{limit.MonthlyTokens, "monthly_tokens"},
-		{limit.MaxInputTokens, "max_input_tokens"},
-		{limit.MaxOutputTokens, "max_output_tokens"},
-	} {
-		if field.value < 0 {
-			return gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_limit", field.name+" must be greater than or equal to zero")
+func quotaLimitStoreError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return gateway.NewError(
+		http.StatusServiceUnavailable,
+		"server_error",
+		"quota_limit_store_unavailable",
+		"quota limit service is temporarily unavailable",
+	).WithCause(err).WithDisposition(false, false, false)
+}
+
+func validateLimitSpec(cfg *gateway.Snapshot, limit gateway.LimitSpec) error {
+	if err := gateway.ValidateLimitSpec(limit); err != nil {
+		return gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_limit", err.Error())
+	}
+	knownProviders := make(map[string]struct{})
+	if cfg != nil {
+		for _, route := range cfg.Routes {
+			if route != nil && route.Provider != "" {
+				knownProviders[route.Provider] = struct{}{}
+			}
 		}
 	}
-	if limit.BudgetDuration.Duration < 0 {
-		return gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_limit", "budget_duration must be greater than or equal to zero")
+	for _, provider := range limit.ProviderAllowlist {
+		if _, ok := knownProviders[provider]; !ok {
+			return gateway.NewError(http.StatusBadRequest, "invalid_request_error", "invalid_limit", fmt.Sprintf("provider_allowlist contains unknown provider %q", provider))
+		}
 	}
 	return nil
 }

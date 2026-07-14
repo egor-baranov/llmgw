@@ -1,0 +1,117 @@
+---
+title: "Gemini API"
+description: "Use native Gemini generateContent, streamGenerateContent, and embedContent endpoints."
+---
+
+llmgw supports the Gemini Developer API's `v1beta` and `v1` model paths. Requests route only to `gemini` routes.
+
+## Authentication
+
+Native clients can keep:
+
+```http
+x-goog-api-key: <gateway-token>
+```
+
+`Authorization: Bearer <gateway-token>` is also accepted. The gateway credential is replaced by the selected route's upstream key.
+
+## Generate content
+
+`contents` must be an array. The model comes from the URL path and is the public gateway alias.
+
+```bash
+curl --silent \
+  http://localhost:8080/v1beta/models/gemini-2.5-flash:generateContent \
+  -H "x-goog-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {
+        "role": "user",
+        "parts": [{"text": "What does an LLM gateway protect?"}]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 256,
+      "candidateCount": 1
+    }
+  }'
+```
+
+The equivalent v1 path is:
+
+```text
+POST /v1/models/{model}:generateContent
+```
+
+The incoming path version takes precedence for that call. The route's `api_version` is used when no ingress version is present in internal execution.
+
+## Stream content
+
+```bash
+curl -N \
+  http://localhost:8080/v1beta/models/gemini-2.5-flash:streamGenerateContent \
+  -H "x-goog-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Count to three."}]}
+    ]
+  }'
+```
+
+The v1 equivalent is:
+
+```text
+POST /v1/models/{model}:streamGenerateContent
+```
+
+The adapter requests upstream SSE and passes native events through. A candidate `finishReason` or blocked prompt feedback is treated as terminal for stream integrity checks.
+
+## Embed content
+
+`content` must be an object.
+
+```bash
+curl --silent \
+  http://localhost:8080/v1beta/models/gemini-embedding-2:embedContent \
+  -H "x-goog-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": {
+      "parts": [{"text": "gateway"}]
+    }
+  }'
+```
+
+The v1 equivalent is:
+
+```text
+POST /v1/models/{model}:embedContent
+```
+
+Embeddings do not stream and require a route declaring `embeddings`.
+
+## Generation accounting
+
+The gateway reads `generationConfig.maxOutputTokens` and `candidateCount` (and their snake_case equivalents) for quota reservation. Tool use, structured output, multimodal parts, reasoning, and Google search usage are detected for capability/pricing policy where applicable.
+
+## Errors
+
+Gemini endpoints return a Google-style envelope:
+
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "request rate limit exceeded",
+    "status": "RESOURCE_EXHAUSTED"
+  }
+}
+```
+
+Common normalized statuses include `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `RESOURCE_EXHAUSTED`, `DEADLINE_EXCEEDED`, and `UNAVAILABLE`.
+
+<Note>
+The current Gemini adapter targets the public Gemini Developer API. Vertex AI project/location routing is not supported.
+</Note>

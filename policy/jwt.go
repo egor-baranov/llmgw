@@ -1,11 +1,6 @@
 package policy
 
 import (
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"net/http"
 	"strings"
@@ -30,12 +25,15 @@ func AuthenticatePrincipal(snapshot *gateway.Snapshot, rawToken string) (*gatewa
 
 func parseJWTPrincipal(cfg gateway.JWTConfig, rawToken string) (*gateway.Principal, error) {
 	cfg = cfg.Normalize()
-	key, err := jwtVerificationKey(cfg)
+	key, err := cfg.VerificationKey()
 	if err != nil {
-		return nil, gateway.NewError(http.StatusInternalServerError, "server_error", "jwt_config_invalid", err.Error())
+		return nil, gateway.NewError(http.StatusInternalServerError, "server_error", "jwt_config_invalid", "authentication configuration is invalid")
 	}
 	claims := jwt.MapClaims{}
-	options := []jwt.ParserOption{jwt.WithValidMethods([]string{cfg.Algorithm})}
+	options := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{cfg.Algorithm}),
+		jwt.WithExpirationRequired(),
+	}
 	if cfg.Issuer != "" {
 		options = append(options, jwt.WithIssuer(cfg.Issuer))
 	}
@@ -51,72 +49,38 @@ func parseJWTPrincipal(cfg gateway.JWTConfig, rawToken string) (*gateway.Princip
 	if err != nil || token == nil || !token.Valid {
 		return nil, gateway.Unauthorized("invalid jwt")
 	}
+	providers, err := claimStrings(claims, cfg.Claims.Providers, true)
+	if err != nil {
+		return nil, gateway.Unauthorized("jwt has invalid provider authorization claims")
+	}
+	models, err := claimStrings(claims, cfg.Claims.Models, true)
+	if err != nil {
+		return nil, gateway.Unauthorized("jwt has invalid model authorization claims")
+	}
+	projects, err := claimStrings(claims, cfg.Claims.Projects, true)
+	if err != nil {
+		return nil, gateway.Unauthorized("jwt has invalid project authorization claims")
+	}
+	permissions, err := claimStrings(claims, cfg.Claims.Permissions, false)
+	if err != nil {
+		return nil, gateway.Unauthorized("jwt has invalid permission claims")
+	}
 	principal := gateway.Principal{
-		ID:        firstNonEmpty(claimString(claims, cfg.Claims.Principal), claimString(claims, "sub")),
-		Name:      claimString(claims, cfg.Claims.Name),
-		KeyID:     claimString(claims, cfg.Claims.KeyID),
-		Providers: claimStrings(claims, cfg.Claims.Providers),
-		Models:    claimStrings(claims, cfg.Claims.Models),
-		Projects:  claimStrings(claims, cfg.Claims.Projects),
+		ID:          firstNonEmpty(claimString(claims, cfg.Claims.Principal), claimString(claims, "sub")),
+		Name:        claimString(claims, cfg.Claims.Name),
+		KeyID:       claimString(claims, cfg.Claims.KeyID),
+		Providers:   providers,
+		Models:      models,
+		Projects:    projects,
+		Permissions: permissions,
 	}
 	if principal.ID == "" {
 		principal.ID = principal.KeyID
 	}
+	if principal.ID == "" {
+		return nil, gateway.Unauthorized("jwt is missing a stable principal identity")
+	}
 	return &principal, nil
-}
-
-func jwtVerificationKey(cfg gateway.JWTConfig) (any, error) {
-	switch strings.ToUpper(cfg.Algorithm) {
-	case "HS256", "HS384", "HS512":
-		if cfg.Secret == "" {
-			return nil, fmt.Errorf("jwt secret is required for %s", cfg.Algorithm)
-		}
-		return []byte(cfg.Secret), nil
-	case "RS256", "RS384", "RS512":
-		return parsePEMPublicKey[*rsa.PublicKey](cfg.PublicKey)
-	case "ES256", "ES384", "ES512":
-		return parsePEMPublicKey[*ecdsa.PublicKey](cfg.PublicKey)
-	case "EDDSA":
-		return parsePEMPublicKey[ed25519.PublicKey](cfg.PublicKey)
-	default:
-		return nil, fmt.Errorf("unsupported jwt algorithm %q", cfg.Algorithm)
-	}
-}
-
-func parsePEMPublicKey[T any](value string) (T, error) {
-	var zero T
-	if strings.TrimSpace(value) == "" {
-		return zero, fmt.Errorf("jwt public key is required")
-	}
-	block, _ := pem.Decode([]byte(value))
-	if block == nil {
-		return zero, fmt.Errorf("invalid jwt public key PEM")
-	}
-	if key, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
-		if typed, ok := key.(T); ok {
-			return typed, nil
-		}
-		return zero, fmt.Errorf("unexpected jwt public key type")
-	}
-	legacy, err := legacyPublicKey[T](block.Bytes)
-	if err != nil {
-		return zero, err
-	}
-	typed, ok := legacy.(T)
-	if !ok {
-		return zero, fmt.Errorf("unexpected jwt public key type")
-	}
-	return typed, nil
-}
-
-func legacyPublicKey[T any](der []byte) (any, error) {
-	var zero T
-	switch any(zero).(type) {
-	case *rsa.PublicKey:
-		return x509.ParsePKCS1PublicKey(der)
-	default:
-		return nil, fmt.Errorf("unsupported jwt public key encoding")
-	}
 }
 
 func claimString(claims jwt.MapClaims, key string) string {
@@ -133,26 +97,36 @@ func claimString(claims jwt.MapClaims, key string) string {
 	}
 }
 
-func claimStrings(claims jwt.MapClaims, key string) []string {
+func claimStrings(claims jwt.MapClaims, key string, requireNonEmpty bool) ([]string, error) {
 	if key == "" {
-		return nil
+		return nil, nil
 	}
-	switch value := claims[key].(type) {
+	raw, present := claims[key]
+	if !present {
+		return nil, nil
+	}
+	var out []string
+	switch value := raw.(type) {
 	case string:
-		return splitClaimList(value)
+		out = splitClaimList(value)
 	case []string:
-		return sanitizeClaimList(value)
+		out = sanitizeClaimList(value)
 	case []any:
-		out := make([]string, 0, len(value))
+		out = make([]string, 0, len(value))
 		for _, item := range value {
-			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
-				out = append(out, strings.TrimSpace(text))
+			text, ok := item.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return nil, fmt.Errorf("claim %s must contain only non-empty strings", key)
 			}
+			out = append(out, strings.TrimSpace(text))
 		}
-		return out
 	default:
-		return nil
+		return nil, fmt.Errorf("claim %s must be a string or string array", key)
 	}
+	if requireNonEmpty && len(out) == 0 {
+		return nil, fmt.Errorf("claim %s must not be empty", key)
+	}
+	return out, nil
 }
 
 func splitClaimList(value string) []string {

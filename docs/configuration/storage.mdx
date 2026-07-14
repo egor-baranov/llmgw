@@ -1,0 +1,215 @@
+---
+title: Storage
+description: Choose memory or Redis for hot-path state and optionally PostgreSQL for durable dynamic quota limits.
+---
+
+llmgw separates hot-path runtime state from durable quota-limit definitions:
+
+```text
+memory or Redis
+  ├─ route RPM / TPM
+  ├─ route and provider concurrency
+  ├─ route circuit breakers
+  ├─ quota reservations and settlement
+  └─ quota usage counters
+
+optional PostgreSQL
+  └─ dynamic key → LimitSpec definitions
+       └─ loaded into an immutable in-memory snapshot
+```
+
+`store.mode` chooses memory or Redis for the first group. Setting a PostgreSQL DSN independently enables durable dynamic limit definitions in either mode.
+
+## Store fields
+
+```yaml
+store:
+  mode: memory
+  redis_url_env: LLMGW_REDIS_URL
+  redis_namespace: llmgw-production
+  postgres_dsn_env: LLMGW_POSTGRES_DSN
+  quota_table: quota_limits
+  limit_cache_ttl: 30s
+  reservation_ttl: 10m
+  startup_timeout: 10s
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `mode` | `memory` | `memory` or `redis`. Values are case-normalized. |
+| `redis_url` / `redis_url_env` | unset | `redis://` or `rediss://` connection URL. Literal and environment-backed forms are mutually exclusive. |
+| `redis_namespace` | empty | Prefix for all llmgw Redis keys. Letters, digits, `.`, `_`, and `-` only; maximum 128 bytes. |
+| `redis_addr` | unset | Legacy/local Redis `host:port` form used when no URL is set. |
+| `redis_password_env` | unset | Environment variable holding the password for `redis_addr`. |
+| `redis_db` | `0` | Non-negative Redis database number for the legacy address form. |
+| `postgres_dsn` / `postgres_dsn_env` | unset | Optional PostgreSQL DSN for dynamic limit definitions. Literal and environment-backed forms are mutually exclusive. |
+| `quota_table` | `quota_limits` | PostgreSQL table for limit definitions. Must be a simple SQL identifier. |
+| `limit_cache_ttl` | `30s` | Background PostgreSQL full-snapshot refresh interval. Zero becomes 30 seconds. |
+| `reservation_ttl` | `10m` | Base quota reservation lease. Runtime may raise it to cover route timeout/retry plans. |
+| `startup_timeout` | `10s` | Per-phase deadline used for PostgreSQL initialization and, separately, startup store health/capability checks. |
+
+All store durations and `redis_db` must be non-negative.
+
+## Memory mode
+
+```yaml
+store:
+  mode: memory
+  reservation_ttl: 10m
+```
+
+Memory mode is suitable for development or a single gateway instance. Its rate limiters, concurrency, circuit state, quota usage, and reservations reset when the process exits. Without PostgreSQL, dynamic limit definitions are also process-local and reset.
+
+<Warning>
+  Multiple replicas in memory mode enforce independent counters. A nominal 100 RPM limit on three replicas can admit roughly three independent 100 RPM streams, depending on traffic distribution.
+</Warning>
+
+You may still configure PostgreSQL in memory mode to persist dynamic **limit definitions**, but hot-path usage and reservations remain per-process.
+
+## Redis mode
+
+Use an environment-backed TLS URL and a unique namespace in production:
+
+```yaml
+store:
+  mode: redis
+  redis_url_env: LLMGW_REDIS_URL
+  redis_namespace: llmgw-prod-eu1
+  reservation_ttl: 10m
+  startup_timeout: 10s
+```
+
+```bash
+export LLMGW_REDIS_URL='rediss://llmgw:<redacted>@redis.example.internal:6379/0'
+```
+
+Redis provides atomic, cross-instance:
+
+- route RPM/TPM admission;
+- route/provider concurrency leases and renewal;
+- circuit-breaker timestamps and state;
+- quota RPM/TPM, active requests, spend, day/month counters;
+- idempotent quota reservation, top-up, commit, and refund; and
+- current quota usage for `GET /v1/limits`.
+
+### Connection forms
+
+<Tabs>
+  <Tab title="URL (recommended)">
+    ```yaml
+    store:
+      mode: redis
+      redis_url_env: LLMGW_REDIS_URL
+      redis_namespace: llmgw-prod
+    ```
+
+    URL form supports ACL usernames, passwords, database numbers, TLS through `rediss://`, and supported go-redis URL query options. `redis_url` cannot be combined with `redis_addr`, `redis_password_env`, or a non-zero `redis_db`.
+  </Tab>
+
+  <Tab title="Address (local/legacy)">
+    ```yaml
+    store:
+      mode: redis
+      redis_addr: 127.0.0.1:6379
+      redis_password_env: LLMGW_REDIS_PASSWORD
+      redis_db: 0
+      redis_namespace: llmgw-dev
+    ```
+
+    This form does not configure TLS. Use it only on localhost or an explicitly trusted isolated network.
+  </Tab>
+</Tabs>
+
+When `mode: redis`, either a Redis URL or `redis_addr` is required. Referenced URL/password environment variables must exist and be non-empty.
+
+### URL safety guardrails
+
+The loader rejects:
+
+- schemes other than `redis` and `rediss`;
+- URLs without a host or with a fragment;
+- negative database numbers;
+- protocols other than RESP 2 or 3;
+- disabled/negative dial, read, write, or pool timeouts;
+- those timeouts above 30 seconds;
+- excessive retries/backoff; and
+- invalid or oversized pool combinations.
+
+When URL pool settings are omitted, llmgw normalizes to a pool size of 64, up to 64 idle connections, and at least 128 maximum active connections. Pool-related values are capped at 4096.
+
+### Redis deployment requirements
+
+At startup, llmgw does more than `PING`: it runs a temporary Lua capability probe that uses the string, hash, sorted-set, expiry, deletion, server-time, and scripting operations required by the gateway. Startup fails if the probe cannot write or execute.
+
+<Warning>
+  The Redis implementation targets a writable standalone primary, not Redis Cluster. The quota scripts atomically touch multiple key families and are not designed around Cluster hash slots.
+</Warning>
+
+Use a namespace unique to the deployment or policy domain. Two independent gateways sharing both Redis and a namespace also share counters, breaker state, leases, and quota accounting.
+
+## PostgreSQL dynamic limit store
+
+PostgreSQL is optional and independent from `store.mode`:
+
+```yaml
+store:
+  mode: redis
+  redis_url_env: LLMGW_REDIS_URL
+  redis_namespace: llmgw-prod
+  postgres_dsn_env: LLMGW_POSTGRES_DSN
+  quota_table: quota_limits
+  limit_cache_ttl: 30s
+  startup_timeout: 10s
+```
+
+```bash
+export LLMGW_POSTGRES_DSN='postgres://llmgw:<redacted>@postgres.example.internal/llmgw?sslmode=require'
+```
+
+At startup llmgw:
+
+1. opens and pings PostgreSQL;
+2. creates the configured table if it does not exist;
+3. loads and validates every key limit into an immutable memory snapshot; and
+4. starts a background full-snapshot refresh every `limit_cache_ttl`.
+
+Inference requests read only the in-memory snapshot; PostgreSQL is not queried per request. `PUT /v1/limits` upserts PostgreSQL and immediately swaps a new local snapshot.
+
+The PostgreSQL client is deliberately bounded to eight open and four idle connections. Connections are recycled after 30 minutes and idle connections after five minutes, preventing the low-volume control plane from consuming an unbounded database pool.
+
+### Managed schema
+
+The service creates columns for every `LimitSpec` field plus `key_id` and `updated_at`. `model_allowlist` and `provider_allowlist` are JSONB; `budget_duration` is stored in Go duration syntax.
+
+`quota_table` must match `[A-Za-z_][A-Za-z0-9_]*`. Schema qualification and quoted identifiers are not supported.
+
+### Refresh failures
+
+A failed refresh leaves the last known-good snapshot active. This keeps the inference hot path available, while:
+
+- a structured `quota_limit_snapshot_refresh_failed` log is emitted; and
+- `llmgw_quota_limit_snapshot_stale` becomes `1` until a later successful refresh.
+
+Readiness checks that the local snapshot exists; a later PostgreSQL refresh error does not invalidate that last-known snapshot. Alert on the stale gauge so control-plane drift is visible.
+
+## Recommended production combination
+
+For multiple gateway instances with durable dynamic governance:
+
+```yaml
+store:
+  mode: redis
+  redis_url_env: LLMGW_REDIS_URL
+  redis_namespace: llmgw-prod-eu1
+  postgres_dsn_env: LLMGW_POSTGRES_DSN
+  quota_table: quota_limits
+  limit_cache_ttl: 15s
+  reservation_ttl: 10m
+  startup_timeout: 10s
+```
+
+- Redis keeps live admission and accounting consistent across instances.
+- PostgreSQL stores the desired key limits.
+- Each instance reads a lock-free local limit snapshot.
+
+Protect both services with network policy, TLS, least-privilege credentials, backups appropriate to their responsibility, and monitoring for startup/readiness failures and stale snapshots.

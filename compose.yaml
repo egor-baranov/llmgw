@@ -9,9 +9,10 @@ services:
     volumes:
       - ./config/config.example.yaml:/etc/llmgw/config.example.yaml:ro
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LLMGW_BEARER_TOKEN: ${LLMGW_BEARER_TOKEN:?set LLMGW_BEARER_TOKEN to a non-empty secret}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY for the configured OpenAI route}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY for the configured Anthropic routes}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY for the configured Gemini route}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"]
       interval: 15s

@@ -1,51 +1,143 @@
-name: Deploy To Nebius
+name: Publish Nebius Candidate Revision
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      allow_plaintext_secrets:
+        description: Explicitly allow raw endpoint/registry secrets instead of configured MysteryBox selectors
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/llmgw
+  NEBIUS_CLI_VERSION: 0.12.242
+  NEBIUS_CLI_LINUX_X86_64_SHA256: 337c1158ff2f47bc94b567e132e28f8669e1e25137714bf93e2b87800e4c6a3e
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "Candidate publishing is restricted to the default branch (${DEFAULT_BRANCH})." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.5
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            printf 'The following Go files need gofmt:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+  publish-candidate:
+    needs: validate
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: nebius-production
+    permissions:
+      contents: read
+      packages: write
     env:
-      NB_PROJECT_ID: ${{ secrets.NB_PROJECT_ID }}
-      NB_SUBNET_ID: ${{ secrets.NB_SUBNET_ID }}
-      NB_SERVICE_ACCOUNT_ID: ${{ secrets.NB_SERVICE_ACCOUNT_ID }}
-      NB_PUBLIC_KEY_ID: ${{ secrets.NB_PUBLIC_KEY_ID }}
-      NB_PRIVATE_KEY_PEM: ${{ secrets.NB_PRIVATE_KEY_PEM }}
       NB_ENDPOINT_NAME: ${{ vars.NB_ENDPOINT_NAME }}
       NB_PLATFORM: ${{ vars.NB_PLATFORM }}
       NB_PRESET: ${{ vars.NB_PRESET }}
       NB_CONTAINER_PORT: ${{ vars.NB_CONTAINER_PORT }}
-      NB_ENDPOINT_AUTH_TOKEN: ${{ secrets.NB_ENDPOINT_AUTH_TOKEN }}
-      NB_REGISTRY_USERNAME: ${{ secrets.NB_REGISTRY_USERNAME }}
-      NB_REGISTRY_PASSWORD: ${{ secrets.NB_REGISTRY_PASSWORD }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      LLMGW_JWT_SECRET: ${{ secrets.LLMGW_JWT_SECRET }}
-      LLMGW_POSTGRES_DSN: ${{ secrets.LLMGW_POSTGRES_DSN }}
-      LLMGW_REDIS_ADDR: ${{ secrets.LLMGW_REDIS_ADDR }}
-      LLMGW_REDIS_PASSWORD: ${{ secrets.LLMGW_REDIS_PASSWORD }}
-      LLMGW_BEARER_TOKEN: ${{ secrets.LLMGW_BEARER_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate required deployment secrets
+        shell: bash
+        env:
+          NB_PROJECT_ID: ${{ secrets.NB_PROJECT_ID }}
+          NB_SUBNET_ID: ${{ secrets.NB_SUBNET_ID }}
+          NB_SERVICE_ACCOUNT_ID: ${{ secrets.NB_SERVICE_ACCOUNT_ID }}
+          NB_PUBLIC_KEY_ID: ${{ secrets.NB_PUBLIC_KEY_ID }}
+          NB_PRIVATE_KEY_PEM: ${{ secrets.NB_PRIVATE_KEY_PEM }}
+          LLMGW_BEARER_TOKEN: ${{ secrets.LLMGW_BEARER_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NB_RUNTIME_SECRET_SELECTOR: ${{ vars.NB_RUNTIME_SECRET_SELECTOR }}
+          NB_REGISTRY_SECRET_SELECTOR: ${{ vars.NB_REGISTRY_SECRET_SELECTOR }}
+          NB_REGISTRY_USERNAME: ${{ secrets.NB_REGISTRY_USERNAME }}
+          NB_REGISTRY_PASSWORD: ${{ secrets.NB_REGISTRY_PASSWORD }}
+          ALLOW_PLAINTEXT_SECRETS: ${{ inputs.allow_plaintext_secrets }}
+        run: |
+          set -euo pipefail
+          for key in NB_PROJECT_ID NB_SUBNET_ID NB_SERVICE_ACCOUNT_ID NB_PUBLIC_KEY_ID NB_PRIVATE_KEY_PEM LLMGW_BEARER_TOKEN; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "${key} must be configured as a non-empty nebius-production environment secret" >&2
+              exit 1
+            fi
+          done
+
+          if [[ -z "${NB_RUNTIME_SECRET_SELECTOR:-}" ]]; then
+            if [[ "${ALLOW_PLAINTEXT_SECRETS:-false}" != true ]]; then
+              echo "Set NB_RUNTIME_SECRET_SELECTOR, or explicitly enable allow_plaintext_secrets for a non-production candidate." >&2
+              exit 1
+            fi
+            for key in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY; do
+              if [[ -z "${!key:-}" ]]; then
+                echo "${key} is required when the plaintext-secret override is enabled" >&2
+                exit 1
+              fi
+            done
+          fi
+
+          if [[ -n "${NB_REGISTRY_SECRET_SELECTOR:-}" && ( -n "${NB_REGISTRY_USERNAME:-}" || -n "${NB_REGISTRY_PASSWORD:-}" ) ]]; then
+            echo "NB_REGISTRY_SECRET_SELECTOR cannot be combined with raw registry credentials" >&2
+            exit 1
+          fi
+          if [[ -n "${NB_REGISTRY_USERNAME:-}" || -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
+            if [[ -z "${NB_REGISTRY_USERNAME:-}" || -z "${NB_REGISTRY_PASSWORD:-}" ]]; then
+              echo "NB_REGISTRY_USERNAME and NB_REGISTRY_PASSWORD must be configured together" >&2
+              exit 1
+            fi
+            if [[ "${ALLOW_PLAINTEXT_SECRETS:-false}" != true ]]; then
+              echo "Raw registry credentials require the explicit allow_plaintext_secrets override" >&2
+              exit 1
+            fi
+          fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -53,15 +145,15 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -73,20 +165,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -sSL https://storage.eu-north1.nebius.cloud/cli/install.sh | bash
-          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
-          test -x "$NEBIUS_BIN"
-          echo "$HOME/.nebius/bin" >> "$GITHUB_PATH"
+          install_dir="$HOME/.local/bin"
+          download_path="$RUNNER_TEMP/nebius"
+          mkdir -p "$install_dir"
+          curl --fail --silent --show-error --location --retry 5 \
+            "https://storage.eu-north1.nebius.cloud/cli/release/${NEBIUS_CLI_VERSION}/linux/x86_64/nebius" \
+            --output "$download_path"
+          echo "${NEBIUS_CLI_LINUX_X86_64_SHA256}  ${download_path}" | sha256sum --check --strict
+          install -m 0755 "$download_path" "$install_dir/nebius"
+          NEBIUS_BIN="$install_dir/nebius"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$NEBIUS_BIN" version --full
+          "$NEBIUS_BIN" ai endpoint create --help >/dev/null
+          "$NEBIUS_BIN" ai endpoint get --help >/dev/null
+          "$NEBIUS_BIN" ai endpoint get-by-name --help >/dev/null
+          "$NEBIUS_BIN" ai endpoint delete --help >/dev/null
 
       - name: Configure Nebius CLI profile
         shell: bash
+        env:
+          NB_PROJECT_ID: ${{ secrets.NB_PROJECT_ID }}
+          NB_SERVICE_ACCOUNT_ID: ${{ secrets.NB_SERVICE_ACCOUNT_ID }}
+          NB_PUBLIC_KEY_ID: ${{ secrets.NB_PUBLIC_KEY_ID }}
+          NB_PRIVATE_KEY_PEM: ${{ secrets.NB_PRIVATE_KEY_PEM }}
         run: |
           set -euo pipefail
-          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
+          NEBIUS_BIN="$HOME/.local/bin/nebius"
           test -n "${NB_PROJECT_ID}"
-          test -n "${NB_SUBNET_ID}"
           test -n "${NB_SERVICE_ACCOUNT_ID}"
           test -n "${NB_PUBLIC_KEY_ID}"
           test -n "${NB_PRIVATE_KEY_PEM}"
@@ -104,53 +209,162 @@ jobs:
             --private-key-file "$KEY_PATH" \
             --parent-id "$NB_PROJECT_ID"
 
-      - name: Deploy endpoint
+      - name: Publish and verify candidate
+        id: deploy
         shell: bash
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          NB_PROJECT_ID: ${{ secrets.NB_PROJECT_ID }}
+          NB_SUBNET_ID: ${{ secrets.NB_SUBNET_ID }}
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          NB_REGISTRY_USERNAME: ${{ secrets.NB_REGISTRY_USERNAME }}
+          NB_REGISTRY_PASSWORD: ${{ secrets.NB_REGISTRY_PASSWORD }}
+          NB_RUNTIME_SECRET_SELECTOR: ${{ vars.NB_RUNTIME_SECRET_SELECTOR }}
+          NB_REGISTRY_SECRET_SELECTOR: ${{ vars.NB_REGISTRY_SECRET_SELECTOR }}
+          ALLOW_PLAINTEXT_SECRETS: ${{ inputs.allow_plaintext_secrets }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLMGW_BEARER_TOKEN: ${{ secrets.LLMGW_BEARER_TOKEN }}
         run: |
           set -euo pipefail
-          NEBIUS_BIN="$HOME/.nebius/bin/nebius"
+          NEBIUS_BIN="$HOME/.local/bin/nebius"
 
-          endpoint_name="${NB_ENDPOINT_NAME:-llmgw}"
+          endpoint_prefix="${NB_ENDPOINT_NAME:-llmgw}"
+          endpoint_prefix="${endpoint_prefix:0:30}"
+          endpoint_name="${endpoint_prefix}-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           platform="${NB_PLATFORM:-cpu-d3}"
           preset="${NB_PRESET:-4vcpu-16gb}"
           container_port="${NB_CONTAINER_PORT:-8080}"
 
-          set +e
-          endpoint_id="$("$NEBIUS_BIN" ai endpoint get-by-name --name "$endpoint_name" --parent-id "$NB_PROJECT_ID" --format jsonpath='{.metadata.id}' 2>/dev/null)"
-          get_status=$?
-          set -e
-
-          if [[ $get_status -eq 0 && -n "$endpoint_id" ]]; then
-            "$NEBIUS_BIN" ai endpoint delete --id "$endpoint_id"
+          if [[ -z "${LLMGW_BEARER_TOKEN:-}" ]]; then
+            echo "LLMGW_BEARER_TOKEN is required; refusing to deploy a public endpoint without gateway authentication" >&2
+            exit 1
           fi
 
-          create_args=(
+          # Nebius endpoints do not support in-place update. Publish an
+          # immutable candidate and leave every live revision untouched. The
+          # run ID makes corrected same-commit reruns publish a fresh candidate.
+          deploy_args=(
             ai endpoint create
             --name "$endpoint_name"
             --parent-id "$NB_PROJECT_ID"
+            --public
+            --subnet-id "$NB_SUBNET_ID"
             --image "$IMAGE_REF"
             --platform "$platform"
             --preset "$preset"
-            --public
             --container-port "$container_port"
-            --subnet-id "$NB_SUBNET_ID"
           )
 
-          if [[ -n "${NB_ENDPOINT_AUTH_TOKEN:-}" ]]; then
-            create_args+=(--auth token --token "$NB_ENDPOINT_AUTH_TOKEN")
+          if [[ -n "${NB_RUNTIME_SECRET_SELECTOR:-}" ]]; then
+            # The selected MysteryBox secret must contain these payload keys.
+            # AUTH_TOKEN and LLMGW_BEARER_TOKEN must have the same value as the
+            # GitHub environment's LLMGW_BEARER_TOKEN used by the health check.
+            deploy_args+=(
+              --auth token
+              --token-secret "$NB_RUNTIME_SECRET_SELECTOR"
+              --env-secret "LLMGW_BEARER_TOKEN=$NB_RUNTIME_SECRET_SELECTOR"
+              --env-secret "OPENAI_API_KEY=$NB_RUNTIME_SECRET_SELECTOR"
+              --env-secret "ANTHROPIC_API_KEY=$NB_RUNTIME_SECRET_SELECTOR"
+              --env-secret "GEMINI_API_KEY=$NB_RUNTIME_SECRET_SELECTOR"
+            )
+          elif [[ "${ALLOW_PLAINTEXT_SECRETS:-false}" == true ]]; then
+            # Explicit non-production escape hatch. These values are visible
+            # to principals that can inspect the endpoint configuration.
+            deploy_args+=(
+              --auth token
+              --token "$LLMGW_BEARER_TOKEN"
+              --env "LLMGW_BEARER_TOKEN=${LLMGW_BEARER_TOKEN}"
+            )
+            for key in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY; do
+              value="${!key:-}"
+              if [[ -z "$value" ]]; then
+                echo "${key} is required by the checked-in deployment config" >&2
+                exit 1
+              fi
+              deploy_args+=(--env "${key}=${value}")
+            done
+          else
+            echo "A MysteryBox runtime selector is required unless the plaintext-secret override is explicitly enabled" >&2
+            exit 1
           fi
 
-          if [[ -n "${NB_REGISTRY_USERNAME:-}" && -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
-            create_args+=(--registry-username "$NB_REGISTRY_USERNAME" --registry-password "$NB_REGISTRY_PASSWORD")
-          fi
-
-          for key in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY LLMGW_JWT_SECRET LLMGW_POSTGRES_DSN LLMGW_REDIS_ADDR LLMGW_REDIS_PASSWORD LLMGW_BEARER_TOKEN; do
-            value="${!key:-}"
-            if [[ -n "$value" ]]; then
-              create_args+=(--env "${key}=${value}")
+          if [[ -n "${NB_REGISTRY_SECRET_SELECTOR:-}" ]]; then
+            if [[ -n "${NB_REGISTRY_USERNAME:-}" || -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
+              echo "NB_REGISTRY_SECRET_SELECTOR cannot be combined with raw registry credentials" >&2
+              exit 1
             fi
-          done
+            deploy_args+=(--registry-secret "$NB_REGISTRY_SECRET_SELECTOR")
+          elif [[ -n "${NB_REGISTRY_USERNAME:-}" && -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
+            if [[ "${ALLOW_PLAINTEXT_SECRETS:-false}" != true ]]; then
+              echo "Raw registry credentials require the explicit allow_plaintext_secrets override" >&2
+              exit 1
+            fi
+            deploy_args+=(--registry-username "$NB_REGISTRY_USERNAME" --registry-password "$NB_REGISTRY_PASSWORD")
+          elif [[ -n "${NB_REGISTRY_USERNAME:-}" || -n "${NB_REGISTRY_PASSWORD:-}" ]]; then
+            echo "NB_REGISTRY_USERNAME and NB_REGISTRY_PASSWORD must be configured together" >&2
+            exit 1
+          fi
 
-          "$NEBIUS_BIN" "${create_args[@]}"
+          set +e
+          endpoint_id="$("$NEBIUS_BIN" "${deploy_args[@]}" --format jsonpath='{.metadata.id}')"
+          create_status=$?
+          set -e
+          if [[ $create_status -ne 0 || -z "$endpoint_id" ]]; then
+            echo "Create did not return a candidate ID; recovering it by the unique endpoint name." >&2
+            endpoint_id="$("$NEBIUS_BIN" ai endpoint get-by-name \
+              --name "$endpoint_name" \
+              --parent-id "$NB_PROJECT_ID" \
+              --format jsonpath='{.metadata.id}' 2>/dev/null || true)"
+          fi
+          if [[ -z "$endpoint_id" ]]; then
+            echo "Unable to determine the candidate ID. Inspect endpoint '$endpoint_name' in project '$NB_PROJECT_ID' and delete it manually if creation succeeded." >&2
+            exit 1
+          fi
+
+          candidate_ready=false
+          cleanup_failed_candidate() {
+            status=$?
+            if [[ "$candidate_ready" != true ]]; then
+              echo "Candidate failed readiness; deleting newly created endpoint $endpoint_id to avoid an orphaned charge." >&2
+              "$NEBIUS_BIN" ai endpoint delete "$endpoint_id" --async || true
+            fi
+            return "$status"
+          }
+          trap cleanup_failed_candidate EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          endpoint_address=""
+          readiness_deadline=$(($(date +%s) + 900))
+          while (( $(date +%s) < readiness_deadline )); do
+            endpoint_address="$("$NEBIUS_BIN" ai endpoint get "$endpoint_id" --format jsonpath='{.status.public_endpoints[0]}' 2>/dev/null || true)"
+            if [[ -n "$endpoint_address" ]]; then
+              endpoint_url="$endpoint_address"
+              if [[ "$endpoint_url" != http://* && "$endpoint_url" != https://* ]]; then
+                endpoint_url="https://$endpoint_url"
+              fi
+              if curl --fail --silent --show-error --max-time 10 \
+                -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+                "$endpoint_url/readyz" >/dev/null; then
+                break
+              fi
+            fi
+            endpoint_address=""
+            sleep 10
+          done
+          if [[ -z "$endpoint_address" ]]; then
+            echo "candidate did not become ready within 15 minutes" >&2
+            exit 1
+          fi
+          candidate_ready=true
+
+          echo "endpoint_id=$endpoint_id" >> "$GITHUB_OUTPUT"
+          echo "endpoint_address=$endpoint_address" >> "$GITHUB_OUTPUT"
+          echo "endpoint_name=$endpoint_name" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Ready Nebius candidate"
+            echo "Created and health-checked immutable candidate \`$endpoint_name\` (\`$endpoint_id\`) at \`$endpoint_address\`."
+            echo "This workflow intentionally does not claim a production cutover: switch your external router/DNS to this address, verify production traffic, and only then retire an older revision."
+          } >> "$GITHUB_STEP_SUMMARY"

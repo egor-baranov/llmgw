@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,8 +151,10 @@ func invokeEndpoint(client *http.Client, baseURL string, endpoint benchmarkEndpo
 	if err != nil {
 		return err
 	}
-	if len(endpoint.body) > 0 {
+	if strings.HasPrefix(endpoint.path, "/v1/") {
 		req.Header.Set("Authorization", "Bearer "+benchmarkToken)
+	}
+	if len(endpoint.body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-LLMGW-User", "benchmark-user")
 		req.Header.Set("X-Project-ID", "benchmark-project")
@@ -194,23 +197,26 @@ func newBenchmarkServer(tb testing.TB) (*httptest.Server, *http.Client) {
 		Rates:    store.NewMemoryRateStore(),
 		Breakers: policy.NewBreaker(),
 	}
+	providers := []gateway.Provider{benchmarkProvider{}}
 	engine := gateway.NewEngine(
 		cfgStore,
-		[]gateway.Provider{benchmarkProvider{}},
+		providers,
 		[]gateway.RequestInterceptor{
 			observer.RequestMetrics{Obs: obsrv},
 			policy.Auth{},
+			policy.MetadataValidation{},
 			policy.RequireUser{},
 			policy.RequestSize{},
 			policy.TokenValidation{},
 			policy.ACL{},
+			gateway.NewCandidatePreflight(providers),
 			policy.ResolveScopes{Limits: limitStore},
 			policy.Quota{Store: quotaStore, Obs: obsrv},
 		},
 		[]gateway.AttemptInterceptor{
+			attemptLimits,
 			policy.AttemptHeaders{},
 			observer.AttemptMetrics{Obs: obsrv},
-			attemptLimits,
 		},
 	)
 	apiServer := gwapi.NewServer(engine, cfgStore, obsrv, limitStore, quotaStore)

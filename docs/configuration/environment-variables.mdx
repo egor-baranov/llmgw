@@ -1,0 +1,138 @@
+---
+title: Environment variables
+description: Keep credentials out of YAML using llmgw's explicit environment-reference fields.
+---
+
+llmgw does not assign special meaning to a fixed set of variable names. Instead, the YAML configuration names variables through `token_envs` and `*_env` fields.
+
+```yaml
+auth:
+  token_envs:
+    LLMGW_CLIENT_TOKEN:
+      id: client
+      key_id: client-prod
+
+routes:
+  openai-primary:
+    provider: openai
+    model: fast-chat
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    capabilities:
+      operations: [chat.completions]
+      max_output_tokens: 16384
+      tokenizer: o200k_base
+```
+
+```bash
+export LLMGW_CLIENT_TOKEN='replace-with-a-random-gateway-token'
+export OPENAI_API_KEY='replace-with-the-upstream-provider-key'
+```
+
+## Environment-reference fields
+
+| YAML location | Environment value | Literal alternative | Resolution behavior |
+| --- | --- | --- | --- |
+| `auth.token_envs.<VARIABLE>` | Gateway bearer token | `auth.tokens.<TOKEN>` | The map key itself is the variable name. The resolved token is added to the static token map. |
+| `auth.jwt.secret_env` | HMAC JWT verification secret | `auth.jwt.secret` | Required for `HS256`/`HS384`/`HS512`. |
+| `auth.jwt.public_key_env` | PEM public verification key | `auth.jwt.public_key` | Required for RSA, ECDSA, or Ed25519 algorithms. Multiline values are supported by the process environment. |
+| `store.redis_url_env` | Full `redis://` or `rediss://` URL | `store.redis_url` | Resolved only for Redis mode. |
+| `store.redis_password_env` | Redis password | none in the address form | Used with `redis_addr`; the URL form embeds or otherwise supplies credentials. |
+| `store.postgres_dsn_env` | PostgreSQL DSN | `store.postgres_dsn` | Enables the durable dynamic-limit snapshot store. |
+| `routes.<name>.api_key_env` | Upstream provider credential | `api_key` | Applied by the selected provider adapter. |
+| `routes.<name>.project_env` | Provider project selector | `project` | Reserved for adapters supporting project routing; built-ins currently reject it. |
+| `routes.<name>.location_env` | Provider location selector | `location` | Reserved for adapters supporting location routing; built-ins currently reject it. |
+
+Every referenced variable must exist and contain a non-whitespace value when the configuration is loaded. Missing variables fail startup or reject a reload. Resolved route and token values are trimmed; JWT key/secret and PostgreSQL DSN values retain their content where needed.
+
+Literal and `_env` variants for the same field are mutually exclusive. `redis_url`/`redis_url_env` also cannot be combined with address-form Redis options.
+
+## No implicit interpolation
+
+This does **not** interpolate:
+
+```yaml
+# Incorrect: the literal string ${OPENAI_API_KEY} becomes the API key.
+api_key: ${OPENAI_API_KEY}
+```
+
+Use:
+
+```yaml
+api_key_env: OPENAI_API_KEY
+```
+
+Similarly, llmgw does not read a `.env` file. Load variables with your shell, container runtime, systemd unit, Kubernetes Secret, or another secret manager integration before launching the process.
+
+## Recommended variable set
+
+The example configuration uses these conventional names, but you may choose others:
+
+| Example variable | Purpose |
+| --- | --- |
+| `LLMGW_BEARER_TOKEN` | Static gateway client credential. |
+| `LLMGW_JWT_SECRET` | HMAC JWT verifier secret. |
+| `LLMGW_JWT_PUBLIC_KEY` | Asymmetric JWT public key. |
+| `OPENAI_API_KEY` | OpenAI or OpenAI-compatible upstream credential. |
+| `ANTHROPIC_API_KEY` | Anthropic upstream credential. |
+| `GEMINI_API_KEY` | Gemini upstream credential. |
+| `LLMGW_REDIS_URL` | Redis connection URL. |
+| `LLMGW_REDIS_PASSWORD` | Password for legacy `redis_addr` configuration. |
+| `LLMGW_POSTGRES_DSN` | PostgreSQL connection DSN. |
+
+## Container example
+
+```yaml
+services:
+  llmgw:
+    image: llmgw:local
+    command: ["-config", "/etc/llmgw/config.yaml"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      LLMGW_BEARER_TOKEN: ${LLMGW_BEARER_TOKEN:?set LLMGW_BEARER_TOKEN}
+      LLMGW_REDIS_URL: ${LLMGW_REDIS_URL:?set LLMGW_REDIS_URL}
+    volumes:
+      - ./config/config.yaml:/etc/llmgw/config.yaml:ro
+```
+
+The `${…}` processing above is performed by Compose, not llmgw.
+
+## Kubernetes example
+
+```yaml
+env:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: llmgw-upstream
+        key: openai-api-key
+  - name: LLMGW_BEARER_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: llmgw-clients
+        key: default-token
+  - name: LLMGW_REDIS_URL
+    valueFrom:
+      secretKeyRef:
+        name: llmgw-state
+        key: redis-url
+```
+
+Reference those exact names from YAML. Mount the configuration read-only and avoid rendering secret values into a ConfigMap.
+
+## Rotation and reload
+
+Environment references are resolved every time the file is loaded, but a normal Unix process inherits a fixed environment at startup. Updating the parent shell, a Compose `.env` file, or a Kubernetes Secret object does **not** mutate the environment of an existing llmgw process. Restart or roll the workload to rotate an environment-backed value.
+
+`SIGHUP` can reload a YAML change that points a reloadable field at a different variable already present in the process environment. It also re-reads the process's current environment in an embedding that explicitly changes it in-process. A failed reload leaves the previous snapshot and its resolved credentials active.
+
+Store changes are restart-only because connections are not rebuilt during reload. A changed `redis_url_env` or `postgres_dsn_env` value changes the resolved store snapshot and causes reload rejection. The address-form `redis_password_env` stores only the variable name in configuration: changing that variable's value under the same name is neither detected nor applied to the existing Redis client, so password rotation always requires a restart.
+
+## Secret-handling guidance
+
+- Use environment-backed fields for all credentials and DSNs.
+- Give gateway client tokens high entropy and rotate them independently from upstream API keys.
+- Do not reuse an upstream provider key as a gateway bearer token.
+- Prefer `rediss://` and PostgreSQL `sslmode=require` or stronger verification settings.
+- Restrict environment inspection, crash dumps, process metadata, and logs.
+- Never print a fully resolved configuration in CI or diagnostics.

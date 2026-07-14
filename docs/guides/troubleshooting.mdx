@@ -1,0 +1,133 @@
+---
+title: "Troubleshooting"
+description: "Diagnose startup, authentication, routing, quota, streaming, and upstream failures."
+---
+
+Start with three pieces of evidence:
+
+```bash
+curl --include http://localhost:8080/readyz
+curl --include http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+docker compose logs --tail=200 llmgw  # when using Compose
+```
+
+Keep the response's `X-Request-ID`; request and attempt logs use the same value.
+
+## Startup failures
+
+### An environment variable is not set or is empty
+
+The service resolves every configured `auth.token_envs`, route `api_key_env`, JWT key environment variable, Redis URL/password environment variable, and PostgreSQL DSN environment variable during startup. Export the value or remove the route/reference you do not intend to run.
+
+The example config enables all three providers, so it requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `LLMGW_BEARER_TOKEN`.
+
+### Authentication is not configured
+
+When `allow_anonymous` is false, configure a static token or JWT. For deliberately unauthenticated local use:
+
+```yaml
+auth:
+  allow_anonymous: true
+```
+
+### YAML reports an unknown field
+
+Configuration parsing is strict. Correct the spelling or move the field to the right section. Multiple `---` YAML documents in one file are not supported.
+
+### A provider or operation is rejected
+
+Every route provider must be registered by the application, and every declared operation must be supported by that adapter. Built-ins are `openai`, `anthropic`, and `gemini`. Gemini Vertex-style backends/project/location are not implemented.
+
+### Redis readiness fails
+
+Verify the URL, TLS, namespace, and permissions. The Redis identity needs commands used for time, counters, hashes, sorted sets, expiration, and Lua (`EVAL`/`EVALSHA`). Use a standalone writable primary; Redis Cluster is not supported.
+
+## HTTP status and error codes
+
+| Status | Common code | Meaning / action |
+| --- | --- | --- |
+| `400` | `invalid_json` | Fix JSON syntax, types, or unknown limit fields |
+| `400` | `unsupported_operation` | No compatible route/capability or a lossless bridge is impossible |
+| `400` | `missing_user`, `missing_project` | Supply the required field/header |
+| `400` | `max_input_tokens_exceeded`, `max_output_tokens_exceeded` | Reduce the request or adjust validated caps |
+| `401` | `unauthorized` | Missing, malformed, invalid, or expired gateway credential |
+| `403` | `forbidden`, `permission_denied` | Principal/quota ACL or operational permission denied the request |
+| `404` | `model_not_found` | Public model alias is not configured on any route |
+| `404` | `quota_limits_not_found` | The authenticated key has no static or dynamic limit definition |
+| `413` | `body_too_large` | Request exceeds global or all compatible route body limits |
+| `429` | `rate_limit_exceeded`, `upstream_rate_limit` | Key/route/provider admission or upstream provider throttled the call |
+| `502` | `request_failed`, `invalid_upstream_response` | Network failure or upstream response did not match the configured protocol |
+| `503` | `not_ready`, `dependency_not_ready`, `quota_store_unavailable` | Configuration/store dependency is unavailable |
+| `504` | `upstream_timeout` | Increase route timeout only after checking upstream latency |
+
+Error envelopes are provider-native: OpenAI-compatible `{ "error": ... }`, Anthropic `{ "type":"error", "error": ... }`, and Google-style `{ "error": {"code", "message", "status"} }`.
+
+## Authentication problems
+
+### Native header does not work
+
+- OpenAI and management endpoints require bearer auth.
+- Anthropic accepts `x-api-key` or bearer auth.
+- Gemini accepts `x-goog-api-key` or bearer auth.
+- If `Authorization` is present, it takes precedence and must be exactly a non-empty bearer scheme.
+
+Remember that the header contains the **gateway** token, not the upstream provider key.
+
+### Swagger UI or metrics returns 403
+
+Give the principal `view_operations`. The default sample token has it. `manage_limits` is separate and is required only for `PUT /v1/limits`.
+
+If `/docs` returns `401` in a browser, the initial page request is protected. Put it behind an authenticated reverse proxy/header injector, or enable anonymous access only on a local trusted instance.
+
+## Model and routing problems
+
+### `/v1/models` omits a model
+
+The list is filtered by:
+
+1. configured routes,
+2. principal `models` and `providers` ACLs,
+3. quota `model_allowlist` and `provider_allowlist`.
+
+Inspect the token principal and its resolved static/dynamic limit. A model can appear once even when several routes back it.
+
+### `/v1/models` lists a model but a native request rejects it
+
+Model discovery is protocol-neutral, while inference ingress pins a provider. For example, calling `/v1/messages` searches only Anthropic routes even if an OpenAI route uses the same public alias. With only a mismatched-provider route, inference returns `unsupported_operation`; use the corresponding provider endpoint or configure the alias for that native provider.
+
+### A request returns `unsupported_operation`
+
+Compare the request with route capabilities: operation, stream, tools, structured output, vision/audio, reasoning, and token limits. For OpenAI bridges, remove non-representable fields or configure a route that natively supports the requested operation. Streaming Responses always need native Responses support.
+
+## Quota problems
+
+### `GET /v1/limits` returns 404
+
+No static profile is mapped to the key and no dynamic override exists. Add `quota.keys.<key_id>` or use an authorized `PUT /v1/limits`.
+
+### Usage seems higher than the visible request
+
+Reservations are conservative. Omitted output limits reserve the route maximum, multi-candidate fields multiply output, and retries/fallbacks represent real upstream attempts. Final usage refunds unused reservations when reliable usage arrives. An active request can appear in held fields until settlement.
+
+### Spend is zero
+
+Add route pricing. Missing token pricing remains non-fatal even under a hard spend limit, but contributes zero calculated spend. Separately, a hard-spend request that enables a provider-metered tool is rejected unless that unit has both a positive price and a positive per-request reservation bound.
+
+## Streaming problems
+
+### Events arrive only at the end
+
+Use `curl -N` and disable buffering in reverse proxies. Preserve `Content-Type: text/event-stream` and avoid compression/buffering middleware that coalesces events.
+
+### The stream terminates early
+
+Search logs by `X-Request-ID`. Upstream disconnects, response byte caps, write-idle timeouts, and missing terminal events can end a stream after headers were committed. Fallback is impossible after the first downstream byte.
+
+### Responses streaming cannot use a chat-only route
+
+That is intentional: the Responses-to-chat compatibility bridge does not transform streams. Add a Responses-native OpenAI route or make a unary request.
+
+## Reload does not apply
+
+Look for `reload_failed`. Reload rejects invalid configuration and restart-only changes to `server`, `store`, or `telemetry`, preserving the previous working snapshot. Restart the service for those sections.

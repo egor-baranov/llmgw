@@ -1,0 +1,258 @@
+---
+title: Routes and providers
+description: Configure public model aliases, upstream endpoints, routing order, retries, and circuit breakers.
+---
+
+Every entry under `routes` is one upstream candidate. Routes that share the same public `model` form a route group: llmgw filters them by request protocol and capability, orders them, and uses eligible alternatives as fallbacks.
+
+```yaml
+routes:
+  openai-primary:
+    provider: openai
+    model: fast-chat
+    upstream_model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    priority: 100
+    weight: 80
+    retries: 1
+    timeout: 30s
+    capabilities:
+      operations: [chat.completions, responses]
+      streaming: true
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      tokenizer: o200k_base
+```
+
+At least one route is required. Route names are internal identifiers used in logs, metrics, headers, shared-store keys, and circuit-breaker state; keep them stable and free of control characters.
+
+## Route fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `provider` | string | required | Compiled provider adapter name. Built-ins are `openai`, `anthropic`, and `gemini`. |
+| `backend` | string | empty | Provider-native backend selector. Built-in Gemini accepts empty or `gemini`; OpenAI and Anthropic require empty. |
+| `model` | string | required | Public model alias selected by clients and returned by `/v1/models`. |
+| `upstream_model` | string | `model` | Provider model identifier sent upstream. |
+| `base_url` | URL | required | Absolute `http` or `https` upstream base URL. User info, query strings, and fragments are rejected. |
+| `api_key` / `api_key_env` | string | empty | Upstream provider credential. The literal and environment-backed forms are mutually exclusive. |
+| `project` / `project_env` | string | empty | Reserved provider project selector. Built-in adapters currently reject project/location routing. |
+| `location` / `location_env` | string | empty | Reserved provider location selector. Built-in adapters currently reject project/location routing. |
+| `api_version` | string | provider default | Upstream API version. Used by Gemini; its default is `v1beta`. |
+| `headers` | string map | empty | Static outbound headers applied after selected client headers and before gateway-generated attempt headers. |
+| `priority` | integer | `0` | Higher priority groups are attempted before lower priority groups. Must be non-negative. |
+| `weight` | integer | `1` | Deterministically selects the first candidate among routes at the same priority. Must be between `0` and `1,000,000`; zero is normalized to `1`. |
+| `retries` | integer | `0` | Additional attempts on the same route for retryable failures, from `0` to `10`. Total calls are `retries + 1`. |
+| `timeout` | duration | `30s` | Per-upstream-call deadline, including each retry and a streaming response’s lifetime. |
+| `limits` | object | disabled | Route and provider attempt limits plus request/response size caps. |
+| `circuit` | object | `3` failures, `30s` cooldown | Route circuit-breaker policy. |
+| `capabilities` | object | required fields | Operation and feature claims used before an upstream attempt. |
+| `pricing` | object | zero-priced | Token, cache, and provider-unit pricing used for spend quotas. |
+
+Provider names are normalized to lowercase and must contain only lowercase letters, digits, `.`, `_`, or `-`, up to 128 bytes. A configured route is also checked against the provider registry at startup and reload: unregistered providers and operations the adapter cannot execute are rejected.
+
+## How routing works
+
+For each request, llmgw:
+
+1. Finds routes whose `model` equals the requested public alias.
+2. On a provider-native endpoint, keeps only routes for that ingress provider.
+3. Removes routes that cannot satisfy the requested operation, streaming mode, tools, structured output, vision, audio, reasoning, or requested output size.
+4. Applies principal and quota provider/model allowlists.
+5. Sorts candidates by descending `priority`, with route name as a stable tie-breaker.
+6. Within each equal-priority group, uses `weight` to choose the first candidate deterministically from an internal execution ID.
+7. Tries fallbacks only when the error disposition permits it and, for streaming, only before a candidate stream is accepted after its initial upstream prefetch. Accepted streams never fall back midstream.
+
+Weights influence which route starts a same-priority group; they do not remove the other routes from fallback order. An omitted or zero weight is normalized to `1`, so every configured route remains eligible to start its same-priority group.
+
+### Weighted active-active routes
+
+```yaml
+routes:
+  fast-east:
+    provider: openai
+    model: fast-chat
+    upstream_model: model-east
+    base_url: https://east.example.internal/v1
+    api_key_env: EAST_API_KEY
+    priority: 100
+    weight: 80
+    capabilities: &chat_capabilities
+      operations: [chat.completions]
+      streaming: true
+      max_input_tokens: 32768
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
+
+  fast-west:
+    provider: openai
+    model: fast-chat
+    upstream_model: model-west
+    base_url: https://west.example.internal/v1
+    api_key_env: WEST_API_KEY
+    priority: 100
+    weight: 20
+    capabilities: *chat_capabilities
+```
+
+### Ordered fallback
+
+Use different priorities for a clear primary/fallback chain:
+
+```yaml
+routes:
+  preferred:
+    provider: openai
+    model: quality-chat
+    upstream_model: model-a
+    base_url: https://primary.example/v1
+    priority: 100
+    # ...capabilities...
+
+  fallback:
+    provider: openai
+    model: quality-chat
+    upstream_model: model-b
+    base_url: https://secondary.example/v1
+    priority: 50
+    # ...capabilities...
+```
+
+<Note>
+  Provider-native ingress pins the provider. For example, `/v1/messages` selects only `anthropic` routes even when another provider shares the same public model alias. OpenAI-compatible endpoints similarly select `openai`, and Gemini endpoints select `gemini`.
+</Note>
+
+## Built-in provider settings
+
+<Tabs>
+  <Tab title="OpenAI-compatible">
+    The `openai` adapter supports `chat.completions`, `responses`, `completions`, and `embeddings`. It sends `Authorization: Bearer <api_key>` when a key is configured and forwards the `OpenAI-Beta` request header unless route `headers` override it.
+
+    ```yaml
+    routes:
+      openai-chat:
+        provider: openai
+        model: fast-chat
+        upstream_model: gpt-4o-mini
+        base_url: https://api.openai.com/v1
+        api_key_env: OPENAI_API_KEY
+        capabilities:
+          operations: [chat.completions, responses]
+          streaming: true
+          max_input_tokens: 128000
+          max_output_tokens: 16384
+          tokenizer: o200k_base
+    ```
+
+    The same adapter can target a hosted vLLM server, Ollama, or another OpenAI-compatible service by changing `base_url` and `upstream_model`. Declare only operations and features the target actually implements.
+
+    When a route declares `chat.completions` but not `responses` or `completions`, the adapter can bridge compatible non-streaming Responses requests and legacy Completions requests to chat. Streaming Responses bridging is not supported; advertise native `responses` support for it.
+  </Tab>
+
+  <Tab title="Anthropic">
+    The `anthropic` adapter supports native Messages as internal `chat.completions`. It sends `x-api-key` and forwards inbound `Anthropic-Version` and `Anthropic-Beta` unless route `headers` override them. It defaults `anthropic-version` to `2023-06-01` only when neither source sets a version.
+
+    ```yaml
+    routes:
+      anthropic-chat:
+        provider: anthropic
+        model: quality-chat
+        upstream_model: claude-sonnet-4-6
+        base_url: https://api.anthropic.com/v1
+        api_key_env: ANTHROPIC_API_KEY
+        headers:
+          anthropic-version: "2023-06-01"
+        capabilities:
+          operations: [chat.completions]
+          streaming: true
+          max_input_tokens: 1000000
+          max_output_tokens: 65536
+          tokenizer: claude
+    ```
+
+    `backend`, `project`, and `location` must be empty.
+  </Tab>
+
+  <Tab title="Gemini">
+    The `gemini` adapter supports content generation as `chat.completions` and `embeddings`. It sends `x-goog-api-key` and builds model-operation URLs under `api_version` (default `v1beta`).
+
+    ```yaml
+    routes:
+      gemini-chat:
+        provider: gemini
+        backend: gemini
+        model: gemini-fast
+        upstream_model: gemini-2.5-flash
+        base_url: https://generativelanguage.googleapis.com
+        api_key_env: GEMINI_API_KEY
+        api_version: v1beta
+        capabilities:
+          operations: [chat.completions]
+          streaming: true
+          max_input_tokens: 1048576
+          max_output_tokens: 65536
+          tokenizer: gemini
+    ```
+
+    `backend` may be empty or `gemini`. Project/location routing and Vertex endpoints are not implemented by the built-in adapter, so `project` and `location` must be empty.
+
+    For native Gemini ingress, the client path version (`/v1/...` or `/v1beta/...`) is preserved upstream and takes precedence over the route value. `api_version` is the fallback used when a canonical request has no version hint.
+  </Tab>
+</Tabs>
+
+## Static headers
+
+Use `headers` for provider version flags or fixed upstream metadata:
+
+```yaml
+headers:
+  anthropic-version: "2023-06-01"
+  x-deployment-label: production
+```
+
+Header names must follow the HTTP token grammar and values may not contain invalid control characters. Names are canonicalized; case-insensitive duplicates and transport-managed fields such as `Host`, `Connection`, `Content-Length`, and other hop-by-hop headers are rejected. Never place credentials in `headers`; use `api_key_env`. Gateway-generated attempt headers and provider authentication are applied after route headers and may replace conflicting values.
+
+llmgw adds request/attempt metadata such as `X-Request-ID`, `X-LLMGW-Route`, `X-LLMGW-Provider`, and `X-LLMGW-Model`. User and project headers are added when safely resolved.
+
+## Attempt controls
+
+```yaml
+retries: 1
+timeout: 30s
+limits:
+  rpm: 3000
+  tpm: 2000000
+  concurrency: 256
+  provider_concurrency: 256
+  max_body_bytes: 4194304
+  max_response_bytes: 16777216
+circuit:
+  failures: 3
+  cooldown: 30s
+```
+
+| Field | Zero means | Scope and behavior |
+| --- | --- | --- |
+| `limits.rpm` | disabled | Upstream calls per minute for this route. Retries count as calls. |
+| `limits.tpm` | disabled | Estimated tokens per minute for this route. RPM and TPM admission is atomic. |
+| `limits.concurrency` | disabled | Simultaneous attempts on this route. Held for the lifetime of a stream. |
+| `limits.provider_concurrency` | disabled | Simultaneous attempts across all routes with the same provider. Every route for one provider must configure the same value. |
+| `limits.max_body_bytes` | disabled | Candidate-specific body cap after the global auth body limit has already bounded decoding. |
+| `limits.max_response_bytes` | built-in cap | Upstream response/stream byte cap. Built-in default is 16 MiB, or 64 MiB for embeddings. |
+| `circuit.failures` | defaults to `3` | Consecutive circuit-qualifying failures before opening the route. |
+| `circuit.cooldown` | defaults to `30s` | Time an open route remains unavailable. |
+
+Memory mode keeps concurrency and circuit state inside one process. Redis mode shares them across instances and renews active slot leases. See [Storage](/configuration/storage).
+
+## Base URL and credential safety
+
+`base_url` must be an absolute HTTP(S) URL with a host and no embedded username/password, query, or fragment. Redirects are refused by the upstream HTTP client to avoid forwarding provider credentials to another host.
+
+For production:
+
+- prefer `https://` upstreams;
+- use `api_key_env`, not `api_key`;
+- keep custom headers free of secrets;
+- give every route a realistic timeout and response size cap; and
+- use stable route names so Redis state and metrics remain interpretable.

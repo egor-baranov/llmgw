@@ -1,6 +1,16 @@
 .git
 .gitignore
+.env
+.env.*
+*.key
+*.p12
+*.pem
+*.pfx
 .idea
 .DS_Store
 bin
+docs
+config/*.yaml
+!config/config.example.yaml
+coverage.out
 openapi.yaml

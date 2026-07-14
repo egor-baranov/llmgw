@@ -1,0 +1,131 @@
+---
+title: "Operations"
+description: "Operate llmgw with health checks, metrics, structured logs, OpenAPI, graceful shutdown, and safe reloads."
+---
+
+## Health and readiness
+
+Both probe endpoints are intentionally public so orchestrators can call them without credentials.
+
+```bash
+curl --fail http://localhost:8080/healthz
+curl --fail http://localhost:8080/readyz
+```
+
+| Endpoint | Success | What it checks |
+| --- | --- | --- |
+| `GET /healthz` | `200 {"ok":true}` | The HTTP process is alive |
+| `GET /readyz` | `200 {"ready":true}` | Configuration is loaded; Redis responds when configured, and any PostgreSQL-backed limit store has a usable local snapshot |
+
+Readiness returns `503` with `dependency_not_ready` if a required store is unavailable. Use `/healthz` for liveness and `/readyz` for readiness; restarting a healthy process solely because Redis is briefly unavailable can amplify an outage.
+
+## Metrics
+
+```bash
+curl --silent http://localhost:8080/metrics \
+  -H "Authorization: Bearer $LLMGW_OPERATIONS_TOKEN"
+```
+
+Metrics use Prometheus exposition format. With authentication enabled, the principal needs `view_operations`.
+
+Important series include:
+
+| Metric | Labels / meaning |
+| --- | --- |
+| `llmgw_inflight_requests` | Current logical requests |
+| `llmgw_requests_total` | `operation`, bounded `model`, `status` |
+| `llmgw_request_duration_seconds` | Request latency by operation/model |
+| `llmgw_attempts_total` | Provider attempts by `provider`, `route`, `status` |
+| `llmgw_quota_denied_total` | Rejections by quota scope/reason |
+| `llmgw_quota_reserved_tokens_total` | Reserved tokens by scope |
+| `llmgw_quota_committed_spend_micros_total` | Committed spend by scope |
+| `llmgw_quota_refunded_spend_micros_total` | Refunded spend by scope |
+| `llmgw_quota_soft_spend_exceeded_total` | Soft-budget crossings by scope |
+| `llmgw_quota_limit_snapshot_stale` | PostgreSQL-backed limit snapshot refresh health |
+
+## Structured logs and request IDs
+
+Logs are JSON on stdout. Request/attempt records include request ID, operation, model, selected route/provider, status, duration, and a safe error code. Do not rely on logs for request or response bodies; the service intentionally avoids logging secrets and prompts.
+
+Supply a correlation ID with:
+
+```bash
+curl --include http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "X-Request-ID: client-request-123"
+```
+
+Valid IDs contain 1–128 visible ASCII characters. Invalid values are replaced. Every response includes the gateway `X-Request-ID`. An upstream provider's request ID is exposed separately as `X-LLMGW-Upstream-Request-ID` when available.
+
+## OpenAPI and Swagger UI
+
+The live specification is generated from code and the current configuration. Model enums and authentication requirements therefore match the running instance.
+
+```bash
+curl --silent http://localhost:8080/openapi.yaml \
+  -H "Authorization: Bearer $LLMGW_OPERATIONS_TOKEN" \
+  --output llmgw-openapi.yaml
+
+curl --silent http://localhost:8080/openapi.json \
+  -H "Authorization: Bearer $LLMGW_OPERATIONS_TOKEN"
+```
+
+The running gateway's Swagger UI is served at `/docs` and redirects to `/docs/index.html`. It is separate from the Mintlify documentation site served by `npm run dev` in `docs/` at `http://localhost:3000`.
+
+```bash
+# Direct browser navigation works only when anonymous mode is enabled locally.
+open http://localhost:8080/docs
+```
+
+`/openapi.yaml`, `/openapi.json`, `/docs`, and `/metrics` require `view_operations` whenever anonymous mode is disabled. A plain browser navigation cannot invent that header; use an authenticated reverse proxy, a browser header injector, or an explicitly anonymous local-only configuration.
+
+Generate a snapshot without opening a listener:
+
+```bash
+LLMGW_BEARER_TOKEN=openapi-placeholder \
+OPENAI_API_KEY=openapi-placeholder \
+ANTHROPIC_API_KEY=openapi-placeholder \
+GEMINI_API_KEY=openapi-placeholder \
+  go run ./cmd/llmgw \
+    -config config/config.example.yaml \
+    -print-openapi > openapi.generated.yaml
+```
+
+The checked-in root `openapi.yaml` is a convenience snapshot. Treat the live generated document as authoritative.
+
+## Reload configuration
+
+The command listens for `SIGHUP`:
+
+```bash
+pkill -HUP -f llmgw
+```
+
+Reload reparses the same configured path, resolves environment values, validates the provider registry, and atomically swaps routes, auth, quota profiles, and other request-path policy. On failure, it logs `reload_failed` and retains the previous snapshot.
+
+The following are restart-only:
+
+- `server` listener and timeout settings
+- `store` connections and cache settings
+- `telemetry` service identity
+
+Changing any of them causes reload to be rejected.
+
+## Graceful shutdown
+
+`SIGINT` and `SIGTERM` stop accepting work, call HTTP graceful shutdown using `server.shutdown_timeout`, close the listener, and close state stores.
+
+For container schedulers, set the termination grace period longer than `shutdown_timeout` and route traffic away after readiness fails/termination begins. Long streams that exceed the shutdown budget may be canceled.
+
+## Store deployment notes
+
+- Use memory mode for development or one disposable instance.
+- Use a unique Redis namespace per deployment when replicas share hot-path state.
+- Prefer `rediss://` and environment-backed credentials.
+- The Redis implementation targets a standalone writable primary, not Cluster.
+- Add PostgreSQL when dynamic limit definitions need durability; it does not replace Redis counters.
+- Startup validates all configured stores before binding successfully.
+
+## Tracing
+
+The default tracer is a no-op behind a small hook interface. The application does not directly initialize OpenTelemetry. To export traces, embed llmgw or adjust application wiring to supply an implementation of `observer.Tracer` that forwards request and attempt spans to your tracing SDK.

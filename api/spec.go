@@ -3,8 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net"
+	"sort"
 	"strings"
 
 	"llmgw/gateway"
@@ -13,6 +12,26 @@ import (
 	"github.com/getkin/kin-openapi/openapi3gen"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	// A relative URL keeps Swagger and generated clients on the public origin
+	// that served the document instead of leaking the container bind address.
+	gatewayServerURL = "/"
+
+	openAIChatSSEExample = "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
+		"data: [DONE]\n\n"
+	openAICompletionSSEExample = "data: {\"id\":\"cmpl_1\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"hello\",\"logprobs\":null,\"finish_reason\":null}]}\n\n" +
+		"data: [DONE]\n\n"
+	openAIResponsesSSEExample = "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n"
+	anthropicSSEExample = "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	geminiSSEExample = "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\n\n"
 )
 
 type healthzResponseDoc struct {
@@ -34,16 +53,37 @@ type errorEnvelopeDoc struct {
 	Error errorObjectDoc `json:"error"`
 }
 
+type anthropicErrorObjectDoc struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type anthropicErrorEnvelopeDoc struct {
+	Type  string                  `json:"type"`
+	Error anthropicErrorObjectDoc `json:"error"`
+}
+
+type geminiErrorObjectDoc struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
+}
+
+type geminiErrorEnvelopeDoc struct {
+	Error geminiErrorObjectDoc `json:"error"`
+}
+
 type modelListResponseDoc struct {
 	Object string                    `json:"object"`
 	Data   []gateway.ModelDescriptor `json:"data"`
 }
 
 type limitsResponseDoc struct {
-	KeyID  string              `json:"key_id"`
-	Source string              `json:"source"`
-	Limits gateway.LimitSpec   `json:"limits"`
-	Usage  *gateway.QuotaUsage `json:"usage,omitempty"`
+	KeyID            string              `json:"key_id"`
+	Source           string              `json:"source"`
+	Limits           gateway.LimitSpec   `json:"limits"`
+	Usage            *gateway.QuotaUsage `json:"usage,omitempty"`
+	UsageUnavailable bool                `json:"usage_unavailable,omitempty"`
 }
 
 type inputAudioDoc struct {
@@ -52,14 +92,15 @@ type inputAudioDoc struct {
 }
 
 type contentPartDoc struct {
-	Type       string         `json:"type,omitempty"`
-	Text       string         `json:"text,omitempty"`
-	Refusal    string         `json:"refusal,omitempty"`
-	ImageURL   string         `json:"image_url,omitempty"`
-	InputText  string         `json:"input_text,omitempty"`
-	InputAudio *inputAudioDoc `json:"input_audio,omitempty"`
-	FileID     string         `json:"file_id,omitempty"`
-	MIMEType   string         `json:"mime_type,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	Text        string          `json:"text,omitempty"`
+	Refusal     string          `json:"refusal,omitempty"`
+	ImageURL    string          `json:"image_url,omitempty"`
+	InputText   string          `json:"input_text,omitempty"`
+	InputAudio  *inputAudioDoc  `json:"input_audio,omitempty"`
+	FileID      string          `json:"file_id,omitempty"`
+	MIMEType    string          `json:"mime_type,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 type toolDoc struct {
@@ -105,13 +146,18 @@ type messageDoc struct {
 	ToolCallID string            `json:"tool_call_id,omitempty"`
 	ToolCalls  []toolCallDoc     `json:"tool_calls,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
+	Refusal    json.RawMessage   `json:"refusal,omitempty"`
 }
 
 type responseOutputDoc struct {
-	Type    string           `json:"type,omitempty"`
-	ID      string           `json:"id,omitempty"`
-	Role    string           `json:"role,omitempty"`
-	Content []contentPartDoc `json:"content,omitempty"`
+	Type      string           `json:"type,omitempty"`
+	ID        string           `json:"id,omitempty"`
+	Status    string           `json:"status,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	Content   []contentPartDoc `json:"content,omitempty"`
+	CallID    string           `json:"call_id,omitempty"`
+	Name      string           `json:"name,omitempty"`
+	Arguments string           `json:"arguments,omitempty"`
 }
 
 type embeddingDataDoc struct {
@@ -121,39 +167,55 @@ type embeddingDataDoc struct {
 }
 
 type chatRequestDoc struct {
-	Messages        []messageDoc       `json:"messages,omitempty"`
-	Tools           []toolDoc          `json:"tools,omitempty"`
-	ToolChoice      json.RawMessage    `json:"tool_choice,omitempty"`
-	ResponseFormat  *responseFormatDoc `json:"response_format,omitempty"`
-	Metadata        map[string]string  `json:"metadata,omitempty"`
-	Reasoning       *reasoningDoc      `json:"reasoning,omitempty"`
-	MaxTokens       int                `json:"max_tokens,omitempty"`
-	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
-	User            string             `json:"user,omitempty"`
+	Messages            []messageDoc       `json:"messages"`
+	Tools               []toolDoc          `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage    `json:"tool_choice,omitempty"`
+	ResponseFormat      *responseFormatDoc `json:"response_format,omitempty"`
+	Metadata            map[string]string  `json:"metadata,omitempty"`
+	Reasoning           *reasoningDoc      `json:"reasoning,omitempty"`
+	MaxTokens           int                `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
+	MaxOutputTokens     int                `json:"max_output_tokens,omitempty"`
+	N                   int                `json:"n,omitempty"`
+	User                string             `json:"user,omitempty"`
+}
+
+type responsesTextDoc struct {
+	Format *responsesFormatDoc `json:"format,omitempty"`
+}
+
+type responsesFormatDoc struct {
+	Type        string          `json:"type,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 type responsesRequestDoc struct {
-	Input           json.RawMessage    `json:"input,omitempty"`
-	Instructions    string             `json:"instructions,omitempty"`
-	Tools           []toolDoc          `json:"tools,omitempty"`
-	ToolChoice      json.RawMessage    `json:"tool_choice,omitempty"`
-	ResponseFormat  *responseFormatDoc `json:"response_format,omitempty"`
-	Metadata        map[string]string  `json:"metadata,omitempty"`
-	Reasoning       *reasoningDoc      `json:"reasoning,omitempty"`
-	MaxOutputTokens int                `json:"max_output_tokens,omitempty"`
-	User            string             `json:"user,omitempty"`
+	Input           json.RawMessage   `json:"input"`
+	Instructions    string            `json:"instructions,omitempty"`
+	Tools           []toolDoc         `json:"tools,omitempty"`
+	ToolChoice      json.RawMessage   `json:"tool_choice,omitempty"`
+	Text            *responsesTextDoc `json:"text,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	Reasoning       *reasoningDoc     `json:"reasoning,omitempty"`
+	MaxOutputTokens int               `json:"max_output_tokens,omitempty"`
+	User            string            `json:"user,omitempty"`
 }
 
 type completionRequestDoc struct {
-	Prompt    json.RawMessage   `json:"prompt,omitempty"`
+	Prompt    json.RawMessage   `json:"prompt"`
 	Suffix    string            `json:"suffix,omitempty"`
 	MaxTokens int               `json:"max_tokens,omitempty"`
+	N         int               `json:"n,omitempty"`
+	BestOf    int               `json:"best_of,omitempty"`
 	User      string            `json:"user,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
 type embeddingRequestDoc struct {
-	Input          json.RawMessage   `json:"input,omitempty"`
+	Input          json.RawMessage   `json:"input"`
 	EncodingFormat string            `json:"encoding_format,omitempty"`
 	Dimensions     int               `json:"dimensions,omitempty"`
 	User           string            `json:"user,omitempty"`
@@ -161,9 +223,10 @@ type embeddingRequestDoc struct {
 }
 
 type chatChoiceDoc struct {
-	Index        int        `json:"index,omitempty"`
-	Message      messageDoc `json:"message,omitempty"`
-	FinishReason string     `json:"finish_reason,omitempty"`
+	Index        int             `json:"index,omitempty"`
+	Message      messageDoc      `json:"message,omitempty"`
+	FinishReason string          `json:"finish_reason,omitempty"`
+	Logprobs     json.RawMessage `json:"logprobs,omitempty"`
 }
 
 type chatResponseDoc struct {
@@ -172,24 +235,46 @@ type chatResponseDoc struct {
 	Model   string          `json:"model,omitempty"`
 	Created int64           `json:"created,omitempty"`
 	Choices []chatChoiceDoc `json:"choices,omitempty"`
-	Usage   gateway.Usage   `json:"usage,omitempty"`
+	Usage   chatUsageDoc    `json:"usage,omitempty"`
+}
+
+type chatUsageDoc struct {
+	PromptTokens            int64           `json:"prompt_tokens,omitempty"`
+	CompletionTokens        int64           `json:"completion_tokens,omitempty"`
+	TotalTokens             int64           `json:"total_tokens,omitempty"`
+	PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails json.RawMessage `json:"completion_tokens_details,omitempty"`
 }
 
 type responsesResponseDoc struct {
-	ID         string              `json:"id,omitempty"`
-	Object     string              `json:"object,omitempty"`
-	Model      string              `json:"model,omitempty"`
-	Created    int64               `json:"created,omitempty"`
-	Status     string              `json:"status,omitempty"`
-	Output     []responseOutputDoc `json:"output,omitempty"`
-	OutputText string              `json:"output_text,omitempty"`
-	Usage      gateway.Usage       `json:"usage,omitempty"`
+	ID                string                `json:"id,omitempty"`
+	Object            string                `json:"object,omitempty"`
+	Model             string                `json:"model,omitempty"`
+	CreatedAt         int64                 `json:"created_at,omitempty"`
+	Status            string                `json:"status,omitempty"`
+	Output            []responseOutputDoc   `json:"output,omitempty"`
+	OutputText        string                `json:"output_text,omitempty"`
+	IncompleteDetails *incompleteDetailsDoc `json:"incomplete_details,omitempty"`
+	Usage             responsesUsageDoc     `json:"usage,omitempty"`
+}
+
+type incompleteDetailsDoc struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+type responsesUsageDoc struct {
+	InputTokens   int64           `json:"input_tokens,omitempty"`
+	OutputTokens  int64           `json:"output_tokens,omitempty"`
+	TotalTokens   int64           `json:"total_tokens,omitempty"`
+	InputDetails  json.RawMessage `json:"input_tokens_details,omitempty"`
+	OutputDetails json.RawMessage `json:"output_tokens_details,omitempty"`
 }
 
 type completionChoiceDoc struct {
-	Index        int    `json:"index,omitempty"`
-	Text         string `json:"text,omitempty"`
-	FinishReason string `json:"finish_reason,omitempty"`
+	Index        int             `json:"index,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	Logprobs     json.RawMessage `json:"logprobs,omitempty"`
+	FinishReason string          `json:"finish_reason,omitempty"`
 }
 
 type completionResponseDoc struct {
@@ -198,7 +283,7 @@ type completionResponseDoc struct {
 	Model   string                `json:"model,omitempty"`
 	Created int64                 `json:"created,omitempty"`
 	Choices []completionChoiceDoc `json:"choices,omitempty"`
-	Usage   gateway.Usage         `json:"usage,omitempty"`
+	Usage   chatUsageDoc          `json:"usage,omitempty"`
 }
 
 type embeddingsResponseDoc struct {
@@ -211,34 +296,36 @@ type embeddingsResponseDoc struct {
 type schemaSet map[string]*openapi3.SchemaRef
 
 const (
-	schemaHealthz       = "Healthz"
-	schemaReadyz        = "Readyz"
-	schemaErrorEnvelope = "ErrorEnvelope"
-	schemaModel         = "Model"
-	schemaModelList     = "ModelList"
-	schemaInputAudio    = "InputAudio"
-	schemaContentPart   = "ContentPart"
-	schemaTool          = "Tool"
-	schemaToolCall      = "ToolCall"
-	schemaJSONSchema    = "JSONSchema"
-	schemaResponseFmt   = "ResponseFormat"
-	schemaReasoning     = "Reasoning"
-	schemaMessage       = "Message"
-	schemaUsage         = "Usage"
-	schemaDuration      = "Duration"
-	schemaQuotaUsage    = "QuotaUsage"
-	schemaLimitSpec     = "LimitSpec"
-	schemaQuotaLimits   = "QuotaLimitsResponse"
-	schemaEmbeddingData = "EmbeddingData"
-	schemaResponseOut   = "ResponseOutput"
-	schemaChatReq       = "ChatRequest"
-	schemaResponsesReq  = "ResponsesRequest"
-	schemaCompletionReq = "CompletionRequest"
-	schemaEmbeddingReq  = "EmbeddingRequest"
-	schemaChatResp      = "ChatResponse"
-	schemaResponsesResp = "ResponsesResponse"
-	schemaCompletionRes = "CompletionResponse"
-	schemaEmbeddingRes  = "EmbeddingsResponse"
+	schemaHealthz        = "Healthz"
+	schemaReadyz         = "Readyz"
+	schemaErrorEnvelope  = "ErrorEnvelope"
+	schemaAnthropicError = "AnthropicErrorEnvelope"
+	schemaGeminiError    = "GeminiErrorEnvelope"
+	schemaModel          = "Model"
+	schemaModelList      = "ModelList"
+	schemaInputAudio     = "InputAudio"
+	schemaContentPart    = "ContentPart"
+	schemaTool           = "Tool"
+	schemaToolCall       = "ToolCall"
+	schemaJSONSchema     = "JSONSchema"
+	schemaResponseFmt    = "ResponseFormat"
+	schemaReasoning      = "Reasoning"
+	schemaMessage        = "Message"
+	schemaUsage          = "Usage"
+	schemaDuration       = "Duration"
+	schemaQuotaUsage     = "QuotaUsage"
+	schemaLimitSpec      = "LimitSpec"
+	schemaQuotaLimits    = "QuotaLimitsResponse"
+	schemaEmbeddingData  = "EmbeddingData"
+	schemaResponseOut    = "ResponseOutput"
+	schemaChatReq        = "ChatRequest"
+	schemaResponsesReq   = "ResponsesRequest"
+	schemaCompletionReq  = "CompletionRequest"
+	schemaEmbeddingReq   = "EmbeddingRequest"
+	schemaChatResp       = "ChatResponse"
+	schemaResponsesResp  = "ResponsesResponse"
+	schemaCompletionRes  = "CompletionResponse"
+	schemaEmbeddingRes   = "EmbeddingsResponse"
 )
 
 type schemaSpec struct {
@@ -286,7 +373,7 @@ func buildOpenAPIDoc(cfg *gateway.Snapshot) (*openapi3.T, error) {
 			Description: "Compact provider-native LLM gateway with provider-aware routing, capability filtering, quota enforcement, SSE streaming, and provider-specific passthrough fields.",
 		},
 		Servers: openapi3.Servers{
-			&openapi3.Server{URL: serverURL(cfg), Description: "Configured gateway listener"},
+			&openapi3.Server{URL: gatewayServerURL, Description: "Configured gateway listener"},
 		},
 		Tags: openapi3.Tags{
 			&openapi3.Tag{Name: "system", Description: "Health, readiness, metrics, and discovery endpoints."},
@@ -305,6 +392,12 @@ func buildOpenAPIDoc(cfg *gateway.Snapshot) (*openapi3.T, error) {
 						WithBearerFormat("API key").
 						WithDescription("Send Authorization: Bearer <token> when auth is enabled."),
 				},
+				"anthropicGatewayKey": &openapi3.SecuritySchemeRef{Value: openapi3.NewSecurityScheme().
+					WithType("apiKey").WithIn("header").WithName("x-api-key").
+					WithDescription("Gateway token on Anthropic-native ingress paths.")},
+				"geminiGatewayKey": &openapi3.SecuritySchemeRef{Value: openapi3.NewSecurityScheme().
+					WithType("apiKey").WithIn("header").WithName("x-goog-api-key").
+					WithDescription("Gateway token on Gemini-native ingress paths.")},
 			},
 		},
 	}
@@ -328,33 +421,33 @@ func buildOpenAPIDoc(cfg *gateway.Snapshot) (*openapi3.T, error) {
 		responseStatus("200", responseWithContent("Prometheus exposition format.", openapi3.Content{
 			"text/plain": media(stringSchemaRef(), nil),
 		})),
-	))})
+	), withSecurity(security))})
 	doc.Paths.Set("/openapi.yaml", &openapi3.PathItem{Get: operation("openapiYAML", "Generated OpenAPI YAML", "", []string{"docs"}, nil, responses(
 		responseStatus("200", responseWithContent("Live OpenAPI document for the gateway surface.", openapi3.Content{
 			"application/yaml": media(stringSchemaRef(), nil),
 			"text/yaml":        media(stringSchemaRef(), nil),
 		})),
-	))})
+	), withSecurity(security))})
 	doc.Paths.Set("/openapi.json", &openapi3.PathItem{Get: operation("openapiJSON", "Generated OpenAPI JSON", "", []string{"docs"}, nil, responses(
 		responseStatus("200", responseWithContent("Live OpenAPI document for the gateway surface.", openapi3.Content{
-			"application/json": media(stringSchemaRef(), nil),
+			"application/json": media(objectAnySchemaRef(), nil),
 		})),
-	))})
+	), withSecurity(security))})
 	doc.Paths.Set("/docs", &openapi3.PathItem{Get: operation("docsRedirect", "Redirect to Swagger UI", "", []string{"docs"}, nil, responses(
 		responseStatus("301", responseWithContent("Redirects to /docs/index.html.", nil)),
-	))})
+	), withSecurity(security))})
 	doc.Paths.Set("/docs/index.html", &openapi3.PathItem{Get: operation("docs", "Swagger UI", "", []string{"docs"}, nil, responses(
 		responseStatus("200", responseWithContent("Swagger UI backed by /openapi.json.", openapi3.Content{
 			"text/html": media(stringSchemaRef(), nil),
 		})),
-	))})
-	doc.Paths.Set("/v1/models", &openapi3.PathItem{Get: operation("listModels", "List configured route models", "", []string{"system"}, nil, responses(
-		responseStatus("200", jsonResponse(refs.ref(schemaModelList), "Configured public models.", map[string]any{
+	), withSecurity(security))})
+	doc.Paths.Set("/v1/models", &openapi3.PathItem{Get: operation("listModels", "List accessible route models", "Returns only models allowed by the authenticated principal's model and provider ACLs.", []string{"system"}, nil, responses(
+		responseStatus("200", jsonResponse(refs.ref(schemaModelList), "Models visible to the caller.", map[string]any{
 			"object": "list",
 			"data":   []map[string]any{{"id": exampleModel, "object": "model", "owned_by": "llmgw"}},
 		})),
 		responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "request failed", "type": "invalid_request_error"}})),
-	))})
+	), withSecurity(security))})
 	doc.Paths.Set("/v1/limits", &openapi3.PathItem{
 		Get: operation("getLimits", "Get quota limits for the authenticated token key", "", []string{"quota"}, nil, responses(
 			responseStatus("200", jsonResponse(refs.ref(schemaQuotaLimits), "Resolved quota limits and current usage for the authenticated key.", map[string]any{
@@ -366,7 +459,7 @@ func buildOpenAPIDoc(cfg *gateway.Snapshot) (*openapi3.T, error) {
 			responseStatus("404", jsonResponse(refs.ref(schemaErrorEnvelope), "No quota limits are configured for the authenticated key.", map[string]any{"error": map[string]any{"message": "no quota limits configured for this token", "type": "invalid_request_error", "code": "quota_limits_not_found"}})),
 			responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "unauthorized", "type": "invalid_request_error"}})),
 		), withSecurity(openapi3.NewSecurityRequirements().With(openapi3.NewSecurityRequirement().Authenticate("bearerAuth")))),
-		Put: operation("putLimits", "Set quota limits for the authenticated token key", "", []string{"quota"}, requestBodyRef(refs.ref(schemaLimitSpec), map[string]any{
+		Put: operation("putLimits", "Set quota limits for the authenticated token key", "Requires the manage_limits principal permission.", []string{"quota"}, requestBodyRef(refs.ref(schemaLimitSpec), map[string]any{
 			"rpm":              120,
 			"tpm":              500000,
 			"max_parallel":     8,
@@ -381,7 +474,7 @@ func buildOpenAPIDoc(cfg *gateway.Snapshot) (*openapi3.T, error) {
 			responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
 		), withSecurity(openapi3.NewSecurityRequirements().With(openapi3.NewSecurityRequirement().Authenticate("bearerAuth")))),
 	})
-	for _, item := range providerOperations(refs, exampleModel, security) {
+	for _, item := range providerOperations(refs, cfg, exampleModel, security) {
 		doc.Paths.Set(item.path, &openapi3.PathItem{Post: item.op})
 	}
 
@@ -402,6 +495,8 @@ func buildGeneratedSchemas(schemas openapi3.Schemas) (schemaSet, error) {
 		{schemaHealthz, healthzResponseDoc{}},
 		{schemaReadyz, readyzResponseDoc{}},
 		{schemaErrorEnvelope, errorEnvelopeDoc{}},
+		{schemaAnthropicError, anthropicErrorEnvelopeDoc{}},
+		{schemaGeminiError, geminiErrorEnvelopeDoc{}},
 		{schemaModel, gateway.ModelDescriptor{}},
 		{schemaModelList, modelListResponseDoc{}},
 		{schemaInputAudio, inputAudioDoc{}},
@@ -457,17 +552,57 @@ func patchGeneratedSchemas(schemas openapi3.Schemas, refs schemaSet) {
 		setAnyAdditionalProperties(schemaFor(schemas, refs.ref(key)))
 	}
 
+	addRequired(schemaFor(schemas, refs.ref(schemaChatReq)), "messages")
+	addRequired(schemaFor(schemas, refs.ref(schemaResponsesReq)), "input")
+	addRequired(schemaFor(schemas, refs.ref(schemaCompletionReq)), "prompt")
+	addRequired(schemaFor(schemas, refs.ref(schemaEmbeddingReq)), "input")
 	setProperty(schemaFor(schemas, refs.ref(schemaTool)), "parameters", objectAnySchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaTool)), "function", objectAnySchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaToolCall)), "function", objectAnySchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaJSONSchema)), "schema", objectAnySchemaRef())
+	setProperty(schemaFor(schemas, refs.ref(schemaContentPart)), "image_url", stringOrObjectSchemaRef())
+	setProperty(schemaFor(schemas, refs.ref(schemaContentPart)), "annotations", arraySchemaRef(objectAnySchemaRef()))
 	setProperty(schemaFor(schemas, refs.ref(schemaChatReq)), "tool_choice", stringOrObjectSchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaResponsesReq)), "tool_choice", stringOrObjectSchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaLimitSpec)), "budget_duration", stringSchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaMessage)), "content", contentUnionSchemaRef(refs.ref(schemaContentPart)))
+	setProperty(schemaFor(schemas, refs.ref(schemaMessage)), "refusal", nullableStringSchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaResponsesReq)), "input", responsesInputSchemaRef(refs.ref(schemaMessage), refs.ref(schemaContentPart)))
 	setProperty(schemaFor(schemas, refs.ref(schemaCompletionReq)), "prompt", textInputSchemaRef())
 	setProperty(schemaFor(schemas, refs.ref(schemaEmbeddingReq)), "input", textInputSchemaRef())
+	completion := schemaFor(schemas, refs.ref(schemaCompletionRes))
+	if completion != nil {
+		choices := schemaFor(schemas, completion.Properties["choices"])
+		if choices != nil {
+			choice := schemaFor(schemas, choices.Items)
+			setProperty(choice, "logprobs", nullableObjectAnySchemaRef())
+		}
+	}
+	chat := schemaFor(schemas, refs.ref(schemaChatResp))
+	if chat != nil {
+		choices := schemaFor(schemas, chat.Properties["choices"])
+		if choices != nil {
+			choice := schemaFor(schemas, choices.Items)
+			setProperty(choice, "logprobs", nullableObjectAnySchemaRef())
+		}
+	}
+}
+
+func addRequired(schema *openapi3.Schema, fields ...string) {
+	if schema == nil {
+		return
+	}
+	seen := make(map[string]struct{}, len(schema.Required)+len(fields))
+	for _, field := range schema.Required {
+		seen[field] = struct{}{}
+	}
+	for _, field := range fields {
+		if _, ok := seen[field]; ok {
+			continue
+		}
+		schema.Required = append(schema.Required, field)
+		seen[field] = struct{}{}
+	}
 }
 
 func inlineTopLevelSchemaRefs(schemas openapi3.Schemas, refs schemaSet) {
@@ -530,7 +665,20 @@ func responses(items ...func(*openapi3.Responses)) *openapi3.Responses {
 	return out
 }
 
-func providerOperations(refs schemaSet, exampleModel string, security *openapi3.SecurityRequirements) []pathOperation {
+func providerOperations(refs schemaSet, cfg *gateway.Snapshot, defaultExample string, security *openapi3.SecurityRequirements) []pathOperation {
+	anthropicSecurity := alternativeSecurity(security, "anthropicGatewayKey")
+	geminiSecurity := alternativeSecurity(security, "geminiGatewayKey")
+	chatModels := providerModelEnum(cfg, "openai", gateway.OpChatCompletions)
+	responseModels := providerModelEnum(cfg, "openai", gateway.OpResponses, gateway.OpChatCompletions)
+	completionModels := providerModelEnum(cfg, "openai", gateway.OpCompletions, gateway.OpChatCompletions)
+	embeddingModels := providerModelEnum(cfg, "openai", gateway.OpEmbeddings)
+	chatExample := firstModelOr(chatModels, defaultExample)
+	responseExample := firstModelOr(responseModels, chatExample)
+	completionExample := firstModelOr(completionModels, chatExample)
+	embeddingExample := firstModelOr(embeddingModels, chatExample)
+	anthropicExample := firstModelOr(providerModelEnum(cfg, "anthropic", gateway.OpChatCompletions), defaultExample)
+	geminiChatExample := firstModelOr(providerModelEnum(cfg, "gemini", gateway.OpChatCompletions), defaultExample)
+	geminiEmbeddingExample := firstModelOr(providerModelEnum(cfg, "gemini", gateway.OpEmbeddings), geminiChatExample)
 	return []pathOperation{
 		{
 			path: "/v1/chat/completions",
@@ -539,8 +687,8 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"OpenAI chat completions",
 				"OpenAI-native endpoint. Requests are routed only to OpenAI routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(requestSchema(refs.ref(schemaChatReq), []string{exampleModel}, true), map[string]any{
-					"model": exampleModel,
+				requestBodyRef(requestSchema(refs.ref(schemaChatReq), chatModels, true), map[string]any{
+					"model": chatExample,
 					"messages": []map[string]any{{
 						"role":    "user",
 						"content": "Say hello in one sentence.",
@@ -549,9 +697,9 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				responses(
 					responseStatus("200", responseWithContent("OpenAI-native chat completion or SSE stream.", openapi3.Content{
 						"application/json":  media(refs.ref(schemaChatResp), nil),
-						"text/event-stream": media(stringSchemaRef(), sseExample("")),
+						"text/event-stream": media(stringSchemaRef(), openAIChatSSEExample),
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", openAIErrorResponse(refs)),
 				),
 				withSecurity(security),
 			),
@@ -561,18 +709,18 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 			op: operation(
 				"openAIResponses",
 				"OpenAI responses",
-				"OpenAI-native endpoint. Requests are routed only to OpenAI routes and are not translated across provider families.",
+				"OpenAI endpoint. Responses-native routes are preferred; unary requests may use a loss-checked chat-completions compatibility bridge. Requests are never translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(requestSchema(refs.ref(schemaResponsesReq), []string{exampleModel}, true), map[string]any{
-					"model": exampleModel,
+				requestBodyRef(requestSchema(refs.ref(schemaResponsesReq), responseModels, true), map[string]any{
+					"model": responseExample,
 					"input": "Summarize the gateway in one line.",
 				}),
 				responses(
 					responseStatus("200", responseWithContent("OpenAI-native response JSON or SSE stream.", openapi3.Content{
 						"application/json":  media(refs.ref(schemaResponsesResp), nil),
-						"text/event-stream": media(stringSchemaRef(), sseExample("response.created")),
+						"text/event-stream": media(stringSchemaRef(), openAIResponsesSSEExample),
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", openAIErrorResponse(refs)),
 				),
 				withSecurity(security),
 			),
@@ -582,18 +730,18 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 			op: operation(
 				"openAICompletions",
 				"OpenAI legacy completions",
-				"OpenAI-native endpoint. Requests are routed only to OpenAI routes and are not translated across provider families.",
+				"OpenAI endpoint. Completions-native routes are preferred; loss-checked text-only requests, including streams, may use a chat-completions compatibility bridge. Requests are never translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(requestSchema(refs.ref(schemaCompletionReq), []string{exampleModel}, true), map[string]any{
-					"model":  exampleModel,
+				requestBodyRef(requestSchema(refs.ref(schemaCompletionReq), completionModels, true), map[string]any{
+					"model":  completionExample,
 					"prompt": "Write one short sentence about Go.",
 				}),
 				responses(
 					responseStatus("200", responseWithContent("OpenAI-native completion JSON or SSE stream.", openapi3.Content{
 						"application/json":  media(refs.ref(schemaCompletionRes), nil),
-						"text/event-stream": media(stringSchemaRef(), sseExample("")),
+						"text/event-stream": media(stringSchemaRef(), openAICompletionSSEExample),
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", openAIErrorResponse(refs)),
 				),
 				withSecurity(security),
 			),
@@ -605,18 +753,18 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"OpenAI embeddings",
 				"OpenAI-native endpoint. Requests are routed only to OpenAI routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(requestSchema(refs.ref(schemaEmbeddingReq), []string{exampleModel}, false), map[string]any{
-					"model": exampleModel,
+				requestBodyRef(requestSchema(refs.ref(schemaEmbeddingReq), embeddingModels, false), map[string]any{
+					"model": embeddingExample,
 					"input": "gateway",
 				}),
 				responses(
 					responseStatus("200", jsonResponse(refs.ref(schemaEmbeddingRes), "OpenAI-native embeddings response.", map[string]any{
 						"object": "list",
-						"model":  exampleModel,
+						"model":  embeddingExample,
 						"data":   []map[string]any{{"object": "embedding", "index": 0, "embedding": []float64{0.1, 0.2}}},
 						"usage":  map[string]any{"prompt_tokens": 1, "total_tokens": 1},
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", openAIErrorResponse(refs)),
 				),
 				withSecurity(security),
 			),
@@ -628,23 +776,24 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"Anthropic messages",
 				"Anthropic-native endpoint. Requests are routed only to Anthropic routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(objectAnySchemaRef(), map[string]any{
-					"model": exampleModel,
+				requestBodyRef(anthropicRequestSchemaRef(), map[string]any{
+					"model":      anthropicExample,
+					"max_tokens": 1024,
 					"messages": []map[string]any{{
 						"role":    "user",
 						"content": "Say hello in one sentence.",
 					}},
 				}),
 				responses(
-					responseStatus("200", jsonResponse(objectAnySchemaRef(), "Anthropic-native message response.", map[string]any{
-						"id":    "msg_1",
-						"type":  "message",
-						"role":  "assistant",
-						"model": exampleModel,
+					responseStatus("200", responseWithContent("Anthropic-native message JSON or SSE stream.", openapi3.Content{
+						"application/json": media(objectAnySchemaRef(), map[string]any{
+							"id": "msg_1", "type": "message", "role": "assistant", "model": anthropicExample,
+						}),
+						"text/event-stream": media(stringSchemaRef(), anthropicSSEExample),
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", anthropicErrorResponse(refs)),
 				),
-				withSecurity(security),
+				withSecurity(anthropicSecurity),
 			),
 		},
 		{
@@ -654,7 +803,7 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"Gemini generateContent (v1beta)",
 				"Gemini-native endpoint. Requests are routed only to Gemini routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(objectAnySchemaRef(), map[string]any{
+				requestBodyRef(geminiGenerateRequestSchemaRef(), map[string]any{
 					"contents": []map[string]any{{
 						"role":  "user",
 						"parts": []map[string]any{{"text": "Say hello in one sentence."}},
@@ -665,10 +814,10 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 						"responseId": "resp_1",
 						"candidates": []map[string]any{{"index": 0}},
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", geminiErrorResponse(refs)),
 				),
-				withPathParameter("model", "Gemini model id from the native URL path.", exampleModel),
-				withSecurity(security),
+				withPathParameter("model", "Gemini model id from the native URL path.", geminiChatExample),
+				withSecurity(geminiSecurity),
 			),
 		},
 		{
@@ -678,19 +827,20 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"Gemini embedContent (v1beta)",
 				"Gemini-native endpoint. Requests are routed only to Gemini routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(objectAnySchemaRef(), map[string]any{
+				requestBodyRef(geminiEmbeddingRequestSchemaRef(), map[string]any{
 					"content": map[string]any{
 						"parts": []map[string]any{{"text": "gateway"}},
 					},
 				}),
 				responses(
 					responseStatus("200", jsonResponse(objectAnySchemaRef(), "Gemini-native embedContent response.", map[string]any{
-						"embeddings": []map[string]any{{"values": []float64{0.1, 0.2}}},
+						"embedding":     map[string]any{"values": []float64{0.1, 0.2}},
+						"usageMetadata": map[string]any{"promptTokenCount": 1, "totalTokenCount": 1},
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", geminiErrorResponse(refs)),
 				),
-				withPathParameter("model", "Gemini model id from the native URL path.", exampleModel),
-				withSecurity(security),
+				withPathParameter("model", "Gemini model id from the native URL path.", geminiEmbeddingExample),
+				withSecurity(geminiSecurity),
 			),
 		},
 		{
@@ -700,7 +850,7 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"Gemini generateContent (v1)",
 				"Gemini-native endpoint. Requests are routed only to Gemini routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(objectAnySchemaRef(), map[string]any{
+				requestBodyRef(geminiGenerateRequestSchemaRef(), map[string]any{
 					"contents": []map[string]any{{
 						"role":  "user",
 						"parts": []map[string]any{{"text": "Say hello in one sentence."}},
@@ -711,10 +861,10 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 						"responseId": "resp_1",
 						"candidates": []map[string]any{{"index": 0}},
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", geminiErrorResponse(refs)),
 				),
-				withPathParameter("model", "Gemini model id from the native URL path.", exampleModel),
-				withSecurity(security),
+				withPathParameter("model", "Gemini model id from the native URL path.", geminiChatExample),
+				withSecurity(geminiSecurity),
 			),
 		},
 		{
@@ -724,22 +874,92 @@ func providerOperations(refs schemaSet, exampleModel string, security *openapi3.
 				"Gemini embedContent (v1)",
 				"Gemini-native endpoint. Requests are routed only to Gemini routes and are not translated across provider families.",
 				[]string{"provider"},
-				requestBodyRef(objectAnySchemaRef(), map[string]any{
+				requestBodyRef(geminiEmbeddingRequestSchemaRef(), map[string]any{
 					"content": map[string]any{
 						"parts": []map[string]any{{"text": "gateway"}},
 					},
 				}),
 				responses(
 					responseStatus("200", jsonResponse(objectAnySchemaRef(), "Gemini-native embedContent response.", map[string]any{
-						"embeddings": []map[string]any{{"values": []float64{0.1, 0.2}}},
+						"embedding":     map[string]any{"values": []float64{0.1, 0.2}},
+						"usageMetadata": map[string]any{"promptTokenCount": 1, "totalTokenCount": 1},
 					})),
-					responseStatus("default", jsonResponse(refs.ref(schemaErrorEnvelope), "Error response.", map[string]any{"error": map[string]any{"message": "invalid request", "type": "invalid_request_error"}})),
+					responseStatus("default", geminiErrorResponse(refs)),
 				),
-				withPathParameter("model", "Gemini model id from the native URL path.", exampleModel),
-				withSecurity(security),
+				withPathParameter("model", "Gemini model id from the native URL path.", geminiEmbeddingExample),
+				withSecurity(geminiSecurity),
 			),
 		},
+		geminiStreamOperation(refs, "/v1beta/models/{model}:streamGenerateContent", "geminiStreamGenerateContentV1Beta", "Gemini streamGenerateContent (v1beta)", geminiChatExample, geminiSecurity),
+		geminiStreamOperation(refs, "/v1/models/{model}:streamGenerateContent", "geminiStreamGenerateContentV1", "Gemini streamGenerateContent (v1)", geminiChatExample, geminiSecurity),
 	}
+}
+
+func alternativeSecurity(base *openapi3.SecurityRequirements, scheme string) *openapi3.SecurityRequirements {
+	if base == nil {
+		return nil
+	}
+	out := openapi3.NewSecurityRequirements()
+	for _, requirement := range *base {
+		out.With(requirement)
+	}
+	out.With(openapi3.NewSecurityRequirement().Authenticate(scheme))
+	return out
+}
+
+func geminiStreamOperation(refs schemaSet, path, operationID, summary, exampleModel string, security *openapi3.SecurityRequirements) pathOperation {
+	return pathOperation{
+		path: path,
+		op: operation(
+			operationID,
+			summary,
+			"Gemini-native SSE endpoint. The gateway preserves provider events while tracking final usage.",
+			[]string{"provider"},
+			requestBodyRef(geminiGenerateRequestSchemaRef(), map[string]any{
+				"contents": []map[string]any{{
+					"role":  "user",
+					"parts": []map[string]any{{"text": "Count to three."}},
+				}},
+			}),
+			responses(
+				responseStatus("200", responseWithContent("Gemini-native SSE stream.", openapi3.Content{
+					"text/event-stream": media(stringSchemaRef(), geminiSSEExample),
+				})),
+				responseStatus("default", geminiErrorResponse(refs)),
+			),
+			withPathParameter("model", "Gemini model id from the native URL path.", exampleModel),
+			withSecurity(security),
+		),
+	}
+}
+
+func anthropicErrorResponse(refs schemaSet) *openapi3.ResponseRef {
+	return jsonResponse(refs.ref(schemaAnthropicError), "Anthropic-native error response.", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"message": "invalid request",
+		},
+	})
+}
+
+func openAIErrorResponse(refs schemaSet) *openapi3.ResponseRef {
+	return jsonResponse(refs.ref(schemaErrorEnvelope), "OpenAI-compatible error response.", map[string]any{
+		"error": map[string]any{
+			"message": "invalid request",
+			"type":    "invalid_request_error",
+		},
+	})
+}
+
+func geminiErrorResponse(refs schemaSet) *openapi3.ResponseRef {
+	return jsonResponse(refs.ref(schemaGeminiError), "Google API error response.", map[string]any{
+		"error": map[string]any{
+			"code":    400,
+			"message": "invalid request",
+			"status":  "INVALID_ARGUMENT",
+		},
+	})
 }
 
 func responseStatus(status string, response *openapi3.ResponseRef) func(*openapi3.Responses) {
@@ -794,9 +1014,39 @@ func modelEnum(cfg *gateway.Snapshot) []string {
 	return lo.Map(cfg.Models(), func(model gateway.ModelDescriptor, _ int) string { return model.ID })
 }
 
+func providerModelEnum(cfg *gateway.Snapshot, provider string, operations ...gateway.Operation) []string {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	models := make([]string, 0)
+	for _, route := range cfg.Routes {
+		if route == nil || route.Provider != provider {
+			continue
+		}
+		if !lo.SomeBy(operations, route.Capabilities.Supports) {
+			continue
+		}
+		if _, ok := seen[route.Model]; ok {
+			continue
+		}
+		seen[route.Model] = struct{}{}
+		models = append(models, route.Model)
+	}
+	sort.Strings(models)
+	return models
+}
+
+func firstModelOr(models []string, fallback string) string {
+	if len(models) > 0 {
+		return models[0]
+	}
+	return fallback
+}
+
 func modelSchema(enum []string) *openapi3.SchemaRef {
 	schema := openapi3.NewStringSchema()
-	schema.Description = "Configured route model name. Requests are matched directly against route models."
+	schema.Description = "Configured public model alias. The selected route maps it to its upstream model."
 	if len(enum) > 0 {
 		schema.Enum = lo.Map(enum, func(value string, _ int) any { return value })
 		schema.Example = enum[0]
@@ -805,37 +1055,10 @@ func modelSchema(enum []string) *openapi3.SchemaRef {
 }
 
 func inferenceSecurity(cfg *gateway.Snapshot) *openapi3.SecurityRequirements {
-	if cfg == nil || (len(cfg.Auth.Tokens) == 0 && !cfg.Auth.JWT.Enabled()) {
+	if cfg == nil || cfg.Auth.AllowAnonymous || (len(cfg.Auth.Tokens) == 0 && !cfg.Auth.JWT.Enabled()) {
 		return nil
 	}
 	return openapi3.NewSecurityRequirements().With(openapi3.NewSecurityRequirement().Authenticate("bearerAuth"))
-}
-
-func serverURL(cfg *gateway.Snapshot) string {
-	listen := ":8080"
-	if cfg != nil && cfg.Server.Listen != "" {
-		listen = cfg.Server.Listen
-	}
-	host, port, err := net.SplitHostPort(listen)
-	if err != nil {
-		if strings.HasPrefix(listen, ":") {
-			return "http://localhost" + listen
-		}
-		return "http://" + strings.TrimSpace(listen)
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "localhost"
-	}
-	return fmt.Sprintf("http://%s:%s", host, port)
-}
-
-func sseExample(event string) string {
-	payload := "data: {\"id\":\"evt_1\"}\n\n" +
-		"data: [DONE]\n\n"
-	if event == "" {
-		return payload
-	}
-	return "event: " + event + "\n" + payload
 }
 
 func schemaFor(schemas openapi3.Schemas, ref *openapi3.SchemaRef) *openapi3.Schema {
@@ -891,6 +1114,44 @@ func integerSchemaRef() *openapi3.SchemaRef {
 
 func objectAnySchemaRef() *openapi3.SchemaRef {
 	return openapi3.NewSchemaRef("", openapi3.NewObjectSchema().WithAnyAdditionalProperties())
+}
+
+func anthropicRequestSchemaRef() *openapi3.SchemaRef {
+	schema := openapi3.NewObjectSchema().WithAnyAdditionalProperties().
+		WithPropertyRef("model", stringSchemaRef()).
+		WithPropertyRef("messages", arraySchemaRef(objectAnySchemaRef())).
+		WithPropertyRef("max_tokens", integerSchemaRef()).
+		WithPropertyRef("stream", openapi3.NewSchemaRef("", openapi3.NewBoolSchema())).
+		WithRequired([]string{"model", "messages", "max_tokens"})
+	return openapi3.NewSchemaRef("", schema)
+}
+
+func geminiGenerateRequestSchemaRef() *openapi3.SchemaRef {
+	schema := openapi3.NewObjectSchema().WithAnyAdditionalProperties().
+		WithPropertyRef("contents", arraySchemaRef(objectAnySchemaRef())).
+		WithPropertyRef("tools", arraySchemaRef(objectAnySchemaRef())).
+		WithPropertyRef("generationConfig", objectAnySchemaRef()).
+		WithRequired([]string{"contents"})
+	return openapi3.NewSchemaRef("", schema)
+}
+
+func geminiEmbeddingRequestSchemaRef() *openapi3.SchemaRef {
+	schema := openapi3.NewObjectSchema().WithAnyAdditionalProperties().
+		WithPropertyRef("content", objectAnySchemaRef()).
+		WithRequired([]string{"content"})
+	return openapi3.NewSchemaRef("", schema)
+}
+
+func nullableObjectAnySchemaRef() *openapi3.SchemaRef {
+	schema := openapi3.NewObjectSchema().WithAnyAdditionalProperties()
+	schema.Nullable = true
+	return openapi3.NewSchemaRef("", schema)
+}
+
+func nullableStringSchemaRef() *openapi3.SchemaRef {
+	schema := openapi3.NewStringSchema()
+	schema.Nullable = true
+	return openapi3.NewSchemaRef("", schema)
 }
 
 func stringOrObjectSchemaRef() *openapi3.SchemaRef {

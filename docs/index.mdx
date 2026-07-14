@@ -1,0 +1,48 @@
+---
+title: "llmgw documentation"
+description: "Run, configure, operate, and extend the llmgw LLM gateway."
+---
+
+llmgw is a compact Go data plane that exposes OpenAI-compatible and provider-native HTTP APIs, routes requests through policy and capability checks, and proxies them to configured OpenAI, Anthropic, or Gemini upstreams.
+
+<Note>
+  The local documentation and gateway are separate processes. `npm run dev` in `docs/` serves this Mintlify site at `http://localhost:3000`; llmgw listens at `http://localhost:8080`. The gateway's protected `http://localhost:8080/docs` page is a separate Swagger UI for its live OpenAPI document.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Run your first request" icon="rocket" href="/getting-started/quickstart">
+    Start the gateway locally and send an authenticated chat completion.
+  </Card>
+  <Card title="Configure routes" icon="route" href="/configuration/routes">
+    Map public model aliases to provider endpoints, capabilities, limits, and pricing.
+  </Card>
+  <Card title="Understand the architecture" icon="diagram-project" href="/concepts/architecture">
+    Follow a request through ingress, policy, routing, provider adapters, and settlement.
+  </Card>
+  <Card title="Explore the API" icon="square-terminal" href="/api-reference/overview">
+    Use OpenAI, Anthropic, and Gemini wire formats plus the generated endpoint reference.
+  </Card>
+</CardGroup>
+
+## What the service provides
+
+- OpenAI-compatible chat completions, Responses, legacy completions, embeddings, and model discovery.
+- Native Anthropic Messages and Gemini generate-content and embedding paths.
+- Model-alias routing with capability filtering, priority, weighted ordering, retries, and fallbacks.
+- Request-scope authentication, metadata validation, token checks, ACLs, and quota reservation.
+- Attempt-scope rate, concurrency, timeout, retry, circuit-breaker, and observability controls.
+- SSE streaming with bounded passthrough, terminal-event validation, usage extraction, and pre-first-byte fallback safety.
+- In-memory development stores and Redis-backed distributed enforcement, with optional PostgreSQL-backed quota-limit snapshots.
+- Prometheus-format metrics, structured logs, readiness checks, and atomic configuration reload.
+
+<Note>
+  llmgw is a provider-aware proxy, not a universal wire-format translator. Requests stay within the provider family selected by their ingress path. The OpenAI Responses and legacy Completions compatibility bridges are adapter-owned exceptions for OpenAI chat-capable routes.
+</Note>
+
+## Start here
+
+1. Follow the [quickstart](/getting-started/quickstart).
+2. Read the [configuration overview](/configuration/overview).
+3. Choose and configure [provider routes](/guides/providers).
+4. Review [security guidance](/configuration/security) before exposing the service.
+5. Use the [operations guide](/guides/operations) for health, readiness, metrics, and reload.

@@ -66,22 +66,34 @@ type QuotaTicket struct {
 }
 
 type Meta struct {
-	RequestID  string
-	Principal  string
-	User       string
-	Project    string
-	RemoteAddr string
-	BodyBytes  int64
-	Headers    http.Header
-	ReceivedAt time.Time
+	RequestID   string
+	ExecutionID string
+	Principal   string
+	User        string
+	Project     string
+	RemoteAddr  string
+	BodyBytes   int64
+	Headers     http.Header
+	ReceivedAt  time.Time
 }
 
 type RequestHints struct {
-	Metadata             map[string]string
-	User                 string
-	MaxOutputTokens      int
-	PromptText           string
-	EstimatedInputTokens int64
+	Metadata                 map[string]string
+	User                     string
+	MaxOutputTokens          int
+	OutputMultiplicity       int64
+	PromptText               string
+	EstimatedInputTokens     int64
+	VisionInputParts         int64
+	AudioInputParts          int64
+	RequiresTools            bool
+	RequiresStructuredOutput bool
+	RequiresVision           bool
+	RequiresAudio            bool
+	RequiresReasoning        bool
+	ProviderUnits            []string
+	MayWritePromptCache      bool
+	APIVersion               string
 }
 
 type Request struct {
@@ -92,6 +104,13 @@ type Request struct {
 	Stream    bool
 	RawBody   json.RawMessage
 	Hints     RequestHints
+}
+
+// TokenProjector removes provider-native binary payloads from the textual
+// representation used for token estimation. Implementations belong to
+// protocol adapters; policy remains provider-agnostic.
+type TokenProjector interface {
+	ProjectTokenText(json.RawMessage) string
 }
 
 type Usage struct {
@@ -115,23 +134,39 @@ type UsageDetails struct {
 }
 
 type Result struct {
-	Provider    string
-	Route       string
-	Model       string
-	Headers     http.Header
-	ContentType string
-	RawBody     []byte
-	RawStream   io.ReadCloser
-	Usage       Usage
-	StatusCode  int
+	Provider      string
+	Route         string
+	Model         string
+	AttemptID     string
+	Headers       http.Header
+	ContentType   string
+	RawBody       []byte
+	RawStream     io.ReadCloser
+	Usage         Usage
+	UsageSnapshot func() Usage
+	StatusCode    int
+}
+
+// FinalUsage returns the latest usage extracted from a streaming response. If
+// the stream did not report usage, it returns the provider's initial estimate.
+func (r *Result) FinalUsage() Usage {
+	if r == nil {
+		return Usage{}
+	}
+	if r.UsageSnapshot != nil {
+		if usage := r.UsageSnapshot(); !usage.IsZero() {
+			return usage
+		}
+	}
+	return r.Usage
 }
 
 func (u EstimatedUsage) TotalTokens() int64 {
-	return u.InputTokens + u.ReservedOutputTokens
+	return saturatingUsageAdd(u.InputTokens, u.ReservedOutputTokens)
 }
 
 func (u ActualUsage) TotalTokens() int64 {
-	return u.InputTokens + u.OutputTokens
+	return saturatingUsageAdd(u.InputTokens, u.OutputTokens)
 }
 
 func (u Usage) IsZero() bool {
@@ -152,6 +187,9 @@ func (e *Request) Clone() *Request {
 	clone := *e
 	if e.Hints.Metadata != nil {
 		clone.Hints.Metadata = cloneStringMap(e.Hints.Metadata)
+	}
+	if e.Hints.ProviderUnits != nil {
+		clone.Hints.ProviderUnits = append([]string(nil), e.Hints.ProviderUnits...)
 	}
 	if len(e.RawBody) > 0 {
 		clone.RawBody = append(json.RawMessage(nil), e.RawBody...)

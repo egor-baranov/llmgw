@@ -1,0 +1,8 @@
+.DS_Store
+.env
+.env.*
+config/*.yaml
+!config/config.example.yaml
+coverage.out
+
+.idea/

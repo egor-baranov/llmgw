@@ -1,0 +1,207 @@
+---
+title: Authentication and authorization
+description: Configure static bearer tokens, JWT verification, principals, ACLs, and operational permissions.
+---
+
+llmgw supports static bearer credentials and locally verified signed JWTs. Both methods resolve to the same principal model, which controls provider, model, project, quota, and operational access.
+
+<Warning>
+  Startup fails when no bearer token or JWT verifier is configured unless `auth.allow_anonymous` is explicitly `true`.
+</Warning>
+
+## Authentication fields
+
+```yaml
+auth:
+  allow_anonymous: false
+  require_user: false
+  require_project: false
+  max_body_bytes: 4194304
+  token_envs: {}
+  tokens: {}
+  jwt: {}
+```
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `allow_anonymous` | boolean | `false` | Permits anonymous inference, model discovery, generated specs, Swagger UI, and metrics. `GET`/`PUT /v1/limits` always require authentication. |
+| `require_user` | boolean | `false` | Rejects inference requests that do not resolve a user value. |
+| `require_project` | boolean | `false` | Rejects inference requests that do not resolve a project value. |
+| `max_body_bytes` | integer | `4194304` | Global request-body limit in bytes. Must be non-negative; zero becomes 4 MiB. It also caps `PUT /v1/limits`. |
+| `tokens` | map | empty | Literal bearer-token-to-principal map. Supported, but avoid it in committed files. |
+| `token_envs` | map | empty | Environment-variable-name-to-principal map. The variable’s value becomes the bearer token. |
+| `jwt` | object | disabled | Signed JWT verification and claim mapping. |
+
+## Static bearer tokens
+
+Use `token_envs` so the credential itself stays outside YAML:
+
+```yaml
+auth:
+  token_envs:
+    LLMGW_CLIENT_TOKEN:
+      id: service-a
+      name: Service A
+      key_id: service-a-prod
+      providers: [openai, anthropic]
+      models: [fast-chat, quality-chat]
+      projects: [catalog, checkout]
+      permissions: [view_operations]
+```
+
+```bash
+export LLMGW_CLIENT_TOKEN='replace-with-a-random-secret'
+```
+
+The map key is the environment variable name. Startup and reload fail if it is missing or empty. Two entries may not resolve to the same token, and a resolved token may not duplicate a literal entry in `tokens`.
+
+Clients normally send:
+
+```http
+Authorization: Bearer replace-with-a-random-secret
+```
+
+Provider-native ingress also accepts its conventional credential header when `Authorization` is absent:
+
+| Ingress | Accepted gateway credential |
+| --- | --- |
+| OpenAI-compatible endpoints | `Authorization: Bearer …` |
+| Anthropic `/v1/messages` | Bearer token or `x-api-key` |
+| Gemini model-operation endpoints | Bearer token or `x-goog-api-key` |
+
+These are **gateway client credentials**, not upstream provider keys. Upstream credentials belong in each route’s `api_key_env`.
+
+## Principal fields
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `id` | string | empty | Stable principal identity and final quota-key fallback. |
+| `name` | string | empty | Descriptive name; it does not affect policy. |
+| `key_id` | string | empty | Preferred key-scoped quota identifier. |
+| `quota_key` | string | empty | Compatibility quota identifier, used when `key_id` is empty. Prefer `key_id` for new configurations. |
+| `providers` | string array | unrestricted | Allows only matching provider adapters. Every entry must have a configured route. |
+| `models` | string array | unrestricted | Allows only matching public model aliases. |
+| `projects` | string array | unrestricted | Allows only matching request projects. A non-empty list makes project metadata mandatory for that principal. |
+| `permissions` | string array | none | Operational permissions. Only `view_operations` and `manage_limits` are accepted. |
+
+A static principal must define at least one of `id`, `key_id`, or `quota_key`. Its effective quota key is the first non-empty value in this order: `key_id`, `quota_key`, `id`.
+
+Empty ACL lists mean unrestricted, not denied. Provider and model ACLs also filter `GET /v1/models` so callers see only usable aliases.
+
+### Permissions
+
+| Permission | Grants |
+| --- | --- |
+| `view_operations` | Access to `/metrics`, `/openapi.yaml`, `/openapi.json`, and `/docs/`. |
+| `manage_limits` | `PUT /v1/limits` for the authenticated principal’s own quota key. |
+
+`GET /v1/limits` requires authentication but no special permission. `manage_limits` does not imply `view_operations`; add both when an administrator needs both capabilities.
+
+## JWT authentication
+
+JWTs are verified locally. A token must:
+
+- use exactly the configured algorithm;
+- contain a valid `exp` claim (expiration is required);
+- satisfy `issuer` and `audience` when configured; and
+- resolve a stable principal identity from the mapped principal claim, `sub`, or mapped `key_id`.
+
+### HMAC example
+
+```yaml
+auth:
+  jwt:
+    algorithm: HS256
+    issuer: https://identity.example.internal
+    audience: llmgw
+    secret_env: LLMGW_JWT_SECRET
+    claims:
+      principal: sub
+      name: name
+      key_id: llmgw_key_id
+      providers: llmgw_providers
+      models: llmgw_models
+      projects: llmgw_projects
+      permissions: llmgw_permissions
+```
+
+HMAC secrets must be at least 32 bytes for `HS256`, 48 bytes for `HS384`, and 64 bytes for `HS512`. Generate a random secret and supply it through `secret_env` in shared environments.
+
+### Asymmetric example
+
+```yaml
+auth:
+  jwt:
+    algorithm: RS256
+    issuer: https://identity.example.internal
+    audience: llmgw
+    public_key_env: LLMGW_JWT_PUBLIC_KEY
+```
+
+`LLMGW_JWT_PUBLIC_KEY` must contain a PEM-encoded public key. RSA accepts PKIX public keys and legacy PKCS#1 public keys and requires a key of at least 2048 bits. ECDSA keys must use the curve required by the selected algorithm. EdDSA requires an Ed25519 public key.
+
+### JWT fields and defaults
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `algorithm` | `HS256` when a secret is set; `RS256` when a public key is set | Supported: `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, `EdDSA`. |
+| `issuer` | unset | When set, the `iss` claim must match. |
+| `audience` | unset | When set, the `aud` claim must include it. |
+| `secret` / `secret_env` | unset | HMAC key. Literal and environment-backed forms are mutually exclusive. |
+| `public_key` / `public_key_env` | unset | Asymmetric verification key. Literal and environment-backed forms are mutually exclusive. |
+| `claims.principal` | `sub` | Stable identity claim. |
+| `claims.name` | `name` | Display-name claim. |
+| `claims.key_id` | `key_id` | Key-scoped quota identifier. |
+| `claims.providers` | `providers` | Provider ACL claim. |
+| `claims.models` | `models` | Model ACL claim. |
+| `claims.projects` | `projects` | Project ACL claim. |
+| `claims.permissions` | `permissions` | Operational permission claim. |
+
+Provider, model, project, and permission claims may be a comma-separated string or a string array. When a provider/model/project claim is present, it must contain at least one non-empty value. Permission claims may be empty, but unsupported permissions are not granted by configuration; use only the documented values.
+
+<Note>
+  The current verifier uses configured PEM keys; it does not fetch JWKS or rotate by `kid`. A normal running process cannot observe an externally changed environment value, so restart to rotate that value. `SIGHUP` works only when YAML switches to another variable already present in the process environment (or an embedding changes the process environment in place).
+</Note>
+
+## User and project resolution
+
+When identity requirements or project ACLs are active, llmgw resolves values in this order.
+
+**User:**
+
+1. `X-LLMGW-User`
+2. `OpenAI-User`
+3. The provider-native request’s user field
+
+**Project:**
+
+1. `X-LLMGW-Project`
+2. `X-Project-ID`
+3. `OpenAI-Project`
+4. `metadata.project` in a decoded request
+
+Forwarded identity values are limited to 512 bytes and may not contain control characters. A principal with a project allowlist rejects both a missing project and a project outside the list.
+
+## Authentication and quota example
+
+The `key_id` links a principal to `quota.keys`:
+
+```yaml
+auth:
+  token_envs:
+    LLMGW_CLIENT_TOKEN:
+      id: service-a
+      key_id: service-a-prod
+      models: [fast-chat]
+
+quota:
+  profiles:
+    standard:
+      rpm: 120
+      tpm: 200000
+      max_parallel: 16
+  keys:
+    service-a-prod: standard
+```
+
+See [Quotas and limits](/configuration/quotas-and-limits) for static profiles, dynamic overrides, reservation behavior, and usage reporting.

@@ -1,0 +1,207 @@
+---
+title: "Providers and routing"
+description: "Configure OpenAI-compatible, Anthropic, and Gemini routes and understand aliases, capabilities, and fallback."
+---
+
+Provider protocols are registered at compile time. The built-in service supports:
+
+| Provider | Public protocol | Canonical operations |
+| --- | --- | --- |
+| `openai` | OpenAI chat, Responses, legacy completions, embeddings | `chat.completions`, `responses`, `completions`, `embeddings` |
+| `anthropic` | Native Messages API | `chat.completions` |
+| `gemini` | Native `generateContent`, `streamGenerateContent`, `embedContent` | `chat.completions`, `embeddings` |
+
+Requests retain their provider-native wire format. An OpenAI request can fall back only to another OpenAI route, an Anthropic request only to Anthropic, and a Gemini request only to Gemini. llmgw does not translate between provider families.
+
+## OpenAI and OpenAI-compatible upstreams
+
+The shared OpenAI adapter works with OpenAI and compatible servers that expose the same paths and response shapes.
+
+```yaml
+routes:
+  openai-primary:
+    provider: openai
+    model: fast-chat
+    upstream_model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    priority: 100
+    weight: 100
+    capabilities:
+      operations: [chat.completions, responses]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: true
+      audio: false
+      reasoning: false
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      tokenizer: o200k_base
+```
+
+For a local compatible server such as Ollama:
+
+```yaml
+routes:
+  ollama-local:
+    provider: openai
+    model: local-chat
+    upstream_model: llama3.1:8b
+    base_url: http://localhost:11434/v1
+    priority: 100
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      tool_calling: false
+      structured_output: false
+      vision_input: false
+      audio: false
+      reasoning: false
+      max_input_tokens: 32768
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
+```
+
+The adapter sets upstream bearer authentication only when `api_key`/`api_key_env` resolves to a value.
+
+### Compatibility bridges
+
+An OpenAI `responses` or `completions` request may use a route that declares only `chat.completions` when conversion is lossless:
+
+- Unary Responses requests can bridge to chat completions for representable fields.
+- Text-only legacy completions, including streams, can bridge to chat completions.
+- Streaming Responses cannot bridge and require a Responses-native route.
+- Unsupported fields, non-text content, tool output that cannot be represented, or incompatible response content fail before dispatch or move to another eligible route.
+
+Declare an operation natively when the upstream actually implements it. The bridge is compatibility behavior, not a substitute for accurate capabilities.
+
+## Anthropic
+
+```yaml
+routes:
+  anthropic-primary:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+    headers:
+      anthropic-version: "2023-06-01"
+    priority: 100
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: true
+      vision_input_token_surcharge: 1600
+      audio: false
+      reasoning: true
+      max_input_tokens: 1000000
+      max_output_tokens: 65536
+      tokenizer: claude
+```
+
+The adapter forwards `Anthropic-Version` and `Anthropic-Beta` client headers unless route `headers` override them, and supplies `2023-06-01` when neither source sets a version. It replaces `x-api-key` with the route credential before the upstream call.
+
+## Gemini Developer API
+
+```yaml
+routes:
+  gemini-primary:
+    provider: gemini
+    backend: gemini
+    model: gemini-2.5-flash
+    base_url: https://generativelanguage.googleapis.com
+    api_key_env: GEMINI_API_KEY
+    api_version: v1beta
+    priority: 100
+    capabilities:
+      operations: [chat.completions]
+      streaming: true
+      tool_calling: true
+      structured_output: true
+      vision_input: true
+      audio: true
+      reasoning: true
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      tokenizer: gemini
+```
+
+Gemini supports `backend: gemini` or an omitted backend. Vertex project/location routing is not implemented; routes that set another backend or `project`/`location` are rejected at startup. The adapter constructs the native model URL and replaces `x-goog-api-key` with the configured route key.
+
+Create a separate embeddings route when the model and capability set differ:
+
+```yaml
+routes:
+  gemini-embeddings:
+    provider: gemini
+    backend: gemini
+    model: gemini-embedding-2
+    base_url: https://generativelanguage.googleapis.com
+    api_key_env: GEMINI_API_KEY
+    api_version: v1beta
+    capabilities:
+      operations: [embeddings]
+      streaming: false
+      tool_calling: false
+      structured_output: false
+      vision_input: true
+      audio: true
+      reasoning: false
+      max_input_tokens: 8192
+      tokenizer: gemini
+```
+
+## Model aliases and fallback groups
+
+Routes with the same `provider` and public `model` form the candidate set for a native request:
+
+```yaml
+routes:
+  primary:
+    provider: openai
+    model: fast-chat
+    upstream_model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    priority: 100
+    weight: 80
+    # capabilities omitted here
+
+  secondary:
+    provider: openai
+    model: fast-chat
+    upstream_model: compatible-model
+    base_url: https://openai-compatible.example.com/v1
+    api_key_env: COMPATIBLE_API_KEY
+    priority: 100
+    weight: 20
+    # capabilities omitted here
+
+  fallback:
+    provider: openai
+    model: fast-chat
+    upstream_model: backup-model
+    base_url: https://backup.example.com/v1
+    api_key_env: BACKUP_API_KEY
+    priority: 50
+    # capabilities omitted here
+```
+
+At priority `100`, weight influences which route is tried first; the other remains a fallback. Priority `50` is considered afterward. Actual configuration must include the complete capability block for each route.
+
+Fallback occurs only for errors classified as fallback-eligible and only before a stream candidate is accepted. Invalid gateway-client authentication, ACL, request shape, or quota admission is terminal for the logical request. Upstream route authentication failures are not retried on the same route, but they are eligible to move to another configured route.
+
+## Capability accuracy
+
+Do not advertise a capability merely because the provider family supports it. Set it for the exact upstream model and deployment. The router uses these values before quota reservation and provider dispatch:
+
+- operation and streaming
+- tool calling and structured output
+- image and audio input
+- reasoning controls
+- maximum input/output tokens
+
+Incorrectly optimistic capabilities can admit a request the upstream rejects. Incorrectly restrictive capabilities produce `unsupported_operation` even when the model could have handled it.

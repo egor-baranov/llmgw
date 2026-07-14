@@ -1,0 +1,157 @@
+---
+title: Reload and validation
+description: Understand startup checks, SIGHUP reloads, restart-only settings, and safe failure behavior.
+---
+
+llmgw loads configuration into an immutable snapshot. New requests use the current snapshot; a successful `SIGHUP` atomically replaces it, while in-flight requests continue with the snapshot they started with.
+
+```bash
+kill -HUP "$(pgrep -x llmgw)"
+```
+
+A successful reload emits a `reloaded` JSON log with the new `loaded_at` time. A failure emits `reload_failed`, returns no partial changes, and leaves the last known-good snapshot active.
+
+## Reloadable and restart-only sections
+
+| Section | Reload behavior |
+| --- | --- |
+| `auth` | Reloadable, including static tokens, referenced credentials, JWT keys/claim mapping, and identity requirements. |
+| `quota` | Reloadable. New requests resolve the new static profiles/key assignments unless a dynamic record overrides them. |
+| `routes` | Reloadable, including URLs, upstream credentials, capabilities, limits, pricing, priorities, and circuit configuration. |
+| `server` | Restart-only. Any difference rejects the whole reload. |
+| `store` | Restart-only. Connections and background workers are not rebuilt. |
+| `telemetry` | Restart-only. Observer identity/export wiring is not rebuilt. |
+
+The comparison occurs after defaults and environment references are resolved. Route credentials and auth tokens are part of reloadable sections, so changing their YAML environment-variable references is reloadable when the named variables are already present. In normal deployments, changing an environment variable's value requires a process restart because the running process environment is fixed. A changed Redis/PostgreSQL value also requires restart because the resolved `store` is restart-only.
+
+<Note>
+  `gateway.ConfigStore.Reload` performs only structural loading. The running application uses `Service.Reload`, which additionally validates the compiled provider registry and enforces restart-only sections. Use the service path for production reloads.
+</Note>
+
+## Validation stages
+
+### YAML decoding
+
+- Exactly one YAML document is accepted.
+- Unknown fields are rejected (`KnownFields` is enabled).
+- Durations must use Go duration strings.
+- Type mismatches and malformed YAML reject the file.
+
+### Authentication and environment
+
+- Auth is required unless anonymous mode is explicitly enabled.
+- Every static principal needs `id`, `key_id`, or `quota_key`.
+- Only `view_operations` and `manage_limits` are accepted permissions.
+- Referenced environment variables must exist and be non-empty.
+- Literal and environment-backed variants are mutually exclusive.
+- Static tokens must be non-empty and unique after environment resolution.
+- JWT algorithm/key type, PEM encoding, issuer/audience configuration, and ECDSA curve are checked before readiness.
+
+### Store configuration
+
+- Mode is `memory` or `redis`.
+- Redis mode requires a URL or address and validates URL scheme/options/namespace.
+- Redis URL and address-form fields may not be mixed.
+- Store durations and database number are non-negative.
+- PostgreSQL DSN forms are mutually exclusive.
+
+At process startup, external stores receive further live checks. Redis must pass its write/script capability probe; PostgreSQL must connect, create/verify its table, and load a valid initial limit snapshot.
+
+### Routes and providers
+
+- At least one route exists; route values may not be null.
+- Provider names follow the canonical lowercase grammar.
+- Models, upstream URLs, headers, priorities, weights, retries, deadlines, byte limits, and circuit settings are validated.
+- Each route declares unique known operations and a supported tokenizer.
+- Generative routes have a positive maximum output size.
+- Capability surcharges and pricing are finite/non-negative and internally consistent.
+- Provider concurrency is consistent across all routes for one provider.
+- Principal/quota provider references have a configured route.
+- Every configured provider exists in the compiled registry and supports every operation advertised by its route.
+- Provider adapters apply native checks, such as rejecting Vertex project/location settings in the built-in Gemini adapter.
+
+### Quota references
+
+- Profile and key names are non-empty.
+- Every `quota.keys` assignment names an existing profile.
+- Limits are non-negative and soft spend does not exceed hard spend.
+- Provider allowlists use valid providers with configured routes.
+
+Model allowlist strings are not required to match the current catalog during file loading. An unknown-only allowlist is valid configuration but will make no configured model eligible for that principal/scope.
+
+## Validate without starting the server
+
+Generating OpenAPI loads the file and binds it to the built-in provider registry, then exits without creating the service listener or store connections:
+
+```bash
+go run ./cmd/llmgw \
+  -config ./config/config.yaml \
+  -print-openapi >/tmp/llmgw-openapi.yaml
+```
+
+This is useful in CI for YAML, cross-reference, and provider-route validation. It does **not** prove Redis/PostgreSQL connectivity because `-print-openapi` does not build stores.
+
+For a complete pre-deployment check, start a disposable instance with the intended dependencies and verify `/readyz`.
+
+```bash
+curl --fail http://127.0.0.1:8080/readyz
+```
+
+## Safe reload workflow
+
+<Steps>
+  <Step title="Validate the candidate file">
+    Run `-print-openapi` with the same required environment variables available to the service.
+  </Step>
+  <Step title="Write atomically">
+    Replace the configuration file with a complete candidate rather than editing it in place while a signal could arrive.
+  </Step>
+  <Step title="Signal one instance">
+    Send `SIGHUP` and inspect its `reloaded` or `reload_failed` event.
+  </Step>
+  <Step title="Probe data-plane behavior">
+    Check `/readyz`, `/v1/models`, and a low-cost inference request using a permitted credential.
+  </Step>
+  <Step title="Roll through replicas">
+    Reload or restart remaining instances. During the rollout, requests may observe either snapshot depending on the instance they reach.
+  </Step>
+</Steps>
+
+## Changes that require restart
+
+Restart rather than reload when changing:
+
+- bind address or any server timeout;
+- memory ↔ Redis mode;
+- Redis URL, address, namespace, credentials, database, or connection options;
+- PostgreSQL DSN, table, or refresh interval;
+- reservation/startup timeout; or
+- telemetry service name.
+
+Because store state and connections are external to the configuration pointer, accepting these changes during reload would create a misleading snapshot. The service rejects them as a unit.
+
+## Failure examples
+
+```text
+decode config: field retriez not found in type gateway.Route
+```
+
+Fix the unknown key; strict decoding catches misspellings rather than silently using a default.
+
+```text
+route gemini-primary is invalid for provider gemini: project/location routing is not supported
+```
+
+Remove unsupported provider-native settings or use an adapter that implements them.
+
+```text
+reload changes restart-only server, store, or telemetry settings
+```
+
+Restart the process so listeners, store clients, and observer state are rebuilt.
+
+```text
+store readiness check: redis requires a writable standalone server and the full command set used by gateway scripts
+```
+
+Point the service at a writable standalone Redis primary with scripting and the required commands enabled.

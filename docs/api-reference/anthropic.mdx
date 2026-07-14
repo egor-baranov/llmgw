@@ -1,0 +1,88 @@
+---
+title: "Anthropic Messages API"
+description: "Send native Anthropic Messages requests through llmgw."
+---
+
+llmgw exposes the Anthropic-native Messages surface:
+
+```text
+POST /v1/messages
+```
+
+Requests route only to `anthropic` routes and are not translated to OpenAI or Gemini.
+
+## Authentication
+
+Native clients can keep the Anthropic credential header:
+
+```http
+x-api-key: <gateway-token>
+```
+
+`Authorization: Bearer <gateway-token>` is also accepted. This value authenticates to llmgw; the adapter replaces it with the selected route's upstream `x-api-key`.
+
+## Create a message
+
+`model`, a positive integer `max_tokens`, and a `messages` array are required.
+
+```bash
+curl --silent http://localhost:8080/v1/messages \
+  -H "x-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 512,
+    "system": "Answer concisely.",
+    "messages": [
+      {"role": "user", "content": "What does an LLM gateway protect?"}
+    ],
+    "metadata": {"user_id": "user-123"}
+  }'
+```
+
+Provider-specific fields are preserved. The adapter patches `model` to the selected route's upstream model and forwards `Anthropic-Version`/`Anthropic-Beta` unless route `headers` override them. It supplies version `2023-06-01` only when neither the client nor route configuration sets one.
+
+## Stream a message
+
+```bash
+curl -N http://localhost:8080/v1/messages \
+  -H "x-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Count to three."}
+    ]
+  }'
+```
+
+The response is Anthropic SSE and completes with a `message_stop` event. Usage events are observed for quota settlement without rewriting the stream.
+
+## Identity and policy metadata
+
+- `metadata.user_id` satisfies `auth.require_user` and is available to user attribution.
+- `X-LLMGW-User` is the provider-neutral alternative.
+- `X-LLMGW-Project` supplies project identity and is checked against project ACLs.
+
+## Prompt caching and metered tools
+
+The gateway detects Anthropic prompt-cache write intent for conservative accounting and extracts cache-read/cache-creation usage from responses. Server tool usage such as web search can be charged when the route defines matching `pricing.provider_units` values.
+
+## Errors
+
+Errors use Anthropic's envelope:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "request rate limit exceeded"
+  }
+}
+```
+
+HTTP status determines the normalized error type (`authentication_error`, `permission_error`, `not_found_error`, `request_too_large`, `rate_limit_error`, `overloaded_error`, or a general API/request error). Safe upstream rate-limit headers are retained.

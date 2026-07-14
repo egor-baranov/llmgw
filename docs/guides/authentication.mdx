@@ -1,0 +1,163 @@
+---
+title: "Authentication"
+description: "Authenticate callers with static tokens or JWTs and restrict models, providers, projects, and operations."
+---
+
+llmgw separates two credential domains:
+
+1. A **gateway credential** authenticates the client to llmgw.
+2. A route's `api_key_env` credential authenticates llmgw to the upstream provider.
+
+The gateway consumes the client credential at ingress. It never forwards that value upstream; the selected provider adapter applies the route credential instead.
+
+## Credential headers
+
+| Surface | Preferred native header | Also accepted |
+| --- | --- | --- |
+| OpenAI endpoints, `/v1/models`, `/v1/limits` | `Authorization: Bearer <token>` | — |
+| Anthropic `/v1/messages` | `x-api-key: <token>` | `Authorization: Bearer <token>` |
+| Gemini model endpoints | `x-goog-api-key: <token>` | `Authorization: Bearer <token>` |
+
+If an `Authorization` header is present on a native endpoint, it must contain a valid bearer value and takes precedence over the native header.
+
+## Environment-backed static tokens
+
+This is the simplest production-appropriate static setup:
+
+```yaml
+auth:
+  allow_anonymous: false
+  token_envs:
+    LLMGW_CUSTOMER_TOKEN:
+      id: customer-42
+      name: Customer 42
+      key_id: customer-42-key
+      providers: [openai, anthropic]
+      models: [fast-chat, claude-sonnet-4-6]
+      projects: [production, evaluation]
+      permissions: []
+```
+
+```bash
+export LLMGW_CUSTOMER_TOKEN="$(openssl rand -hex 32)"
+```
+
+The map key is an environment variable name, not the token itself. Startup and reload fail when a declared variable is absent or empty.
+
+Inline tokens are supported for disposable development configurations:
+
+```yaml
+auth:
+  tokens:
+    local-insecure-token:
+      id: local
+      key_id: local-key
+```
+
+<Warning>
+Do not commit an `auth.tokens` secret. Use `auth.token_envs` or JWTs for shared environments.
+</Warning>
+
+## Principal fields
+
+| Field | Effect |
+| --- | --- |
+| `id` | Stable identity used in logs and as a quota-key fallback |
+| `name` | Human-readable label |
+| `key_id` | Preferred key for quota profiles and dynamic limits |
+| `quota_key` | Alternate quota-key fallback when `key_id` is empty |
+| `providers` | Provider ACL; empty means all configured providers |
+| `models` | Public model-alias ACL; empty means all configured models |
+| `projects` | Allowed project values; when non-empty, a matching project is required |
+| `permissions` | Operational permissions: `view_operations` and/or `manage_limits` |
+
+At least one of `id`, `key_id`, or `quota_key` is required. The quota subject resolves in the order `key_id`, `quota_key`, then `id`.
+
+### Permissions
+
+- `view_operations` allows access to `/metrics`, `/openapi.json`, `/openapi.yaml`, and `/docs` when authentication is enabled.
+- `manage_limits` allows `PUT /v1/limits` for the caller's own effective quota key (`key_id`, then `quota_key`, then `id`).
+- Any authenticated principal with a key ID can use `GET /v1/limits`.
+
+Permissions do not bypass model, provider, project, capability, or quota checks.
+
+## JWT authentication
+
+JWT mode verifies tokens locally. Every JWT must have a valid `exp` claim. Optional configured issuer and audience checks are enforced.
+
+### HMAC example
+
+```yaml
+auth:
+  allow_anonymous: false
+  jwt:
+    algorithm: HS256
+    issuer: llmgw
+    audience: gateway
+    secret_env: LLMGW_JWT_SECRET
+    claims:
+      principal: sub
+      name: name
+      key_id: key_id
+      providers: providers
+      models: models
+      projects: projects
+      permissions: permissions
+```
+
+Supported HMAC algorithms are `HS256`, `HS384`, and `HS512`. Their secrets must be at least 32, 48, and 64 bytes respectively. Set `secret_env` rather than `secret` in production.
+
+### Public-key verification
+
+```yaml
+auth:
+  jwt:
+    algorithm: RS256
+    issuer: https://issuer.example.com
+    audience: llmgw
+    public_key_env: LLMGW_JWT_PUBLIC_KEY
+```
+
+Supported public-key algorithms are `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, and `EdDSA`. The environment variable must contain the expected PEM public key. The service does not fetch JWKS documents.
+
+JWT claim mappings default to the names shown above. List-valued ACL claims may be JSON string arrays or comma-separated strings. If `sub` and the mapped principal claim are absent, `key_id` becomes the identity; a token without either is rejected.
+
+## User and project requirements
+
+```yaml
+auth:
+  require_user: true
+  require_project: true
+```
+
+The gateway recognizes:
+
+- OpenAI `user`
+- Anthropic `metadata.user_id`
+- `X-LLMGW-User` for any provider
+- `X-LLMGW-Project` for any provider
+- A decoded request `metadata.project` where supported
+
+Forwarded user/project values are limited to 512 bytes and cannot contain control characters. A principal with a non-empty `projects` ACL always needs a matching project even when the global `require_project` option is false.
+
+## Anonymous development mode
+
+```yaml
+auth:
+  allow_anonymous: true
+```
+
+Anonymous mode makes inference, model discovery, generated specs, Swagger UI, and metrics accessible without a gateway token. Anonymous requests use `anonymous` as their quota identity where applicable.
+
+<Warning>
+Use anonymous mode only on a trusted local interface or behind another authenticated gateway. It is an explicit opt-in because it exposes both inference and operational metadata.
+</Warning>
+
+## Test a token
+
+```bash
+curl --include http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+A successful response is `200`. Invalid or expired credentials return `401`; a valid token blocked by an ACL or permission returns `403`.

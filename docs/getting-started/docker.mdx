@@ -1,0 +1,99 @@
+---
+title: "Run with Docker"
+description: "Build and run llmgw locally with Docker Compose or Docker."
+---
+
+The repository includes a multi-stage `Dockerfile` and a Compose service with a readiness health check.
+
+## Docker Compose
+
+The checked-in Compose configuration mounts `config/config.example.yaml`, which enables all three built-in providers.
+
+<Steps>
+  <Step title="Export required secrets">
+
+```bash
+export OPENAI_API_KEY="..."
+export ANTHROPIC_API_KEY="..."
+export GEMINI_API_KEY="..."
+export LLMGW_BEARER_TOKEN="$(openssl rand -hex 32)"
+```
+
+  </Step>
+  <Step title="Build and start">
+
+```bash
+docker compose up --build -d
+```
+
+  </Step>
+  <Step title="Wait for readiness">
+
+```bash
+docker compose ps
+curl --fail http://localhost:8080/readyz
+```
+
+  </Step>
+  <Step title="Inspect logs">
+
+```bash
+docker compose logs --follow llmgw
+```
+
+Logs are JSON and include the request ID, operation, model, selected provider/route, status, and duration where available.
+
+  </Step>
+</Steps>
+
+Stop and remove the local container with:
+
+```bash
+docker compose down
+```
+
+## Run the image directly
+
+To use an edited local configuration:
+
+```bash
+cp config/config.example.yaml config/config.yaml
+docker build -t llmgw:local .
+
+docker run --rm \
+  --name llmgw \
+  -p 8080:8080 \
+  -e LLMGW_BEARER_TOKEN \
+  -e OPENAI_API_KEY \
+  -e ANTHROPIC_API_KEY \
+  -e GEMINI_API_KEY \
+  -v "$PWD/config/config.yaml:/etc/llmgw/config.yaml:ro" \
+  llmgw:local
+```
+
+The production image runs as an unprivileged `llmgw` user and starts with:
+
+```text
+llmgw -config /etc/llmgw/config.yaml
+```
+
+<Warning>
+Do not bake API keys or gateway tokens into an image or commit them in YAML. Prefer `api_key_env`, `auth.token_envs`, `store.redis_url_env`, and `store.postgres_dsn_env`.
+</Warning>
+
+## Use only one provider
+
+The sample configuration requires all configured route secrets at startup. To run with only OpenAI, for example:
+
+1. Copy `config/config.example.yaml` to `config/config.yaml`.
+2. Remove the Anthropic and Gemini routes.
+3. Remove their models and providers from the `auth.token_envs` principal.
+4. Mount the edited file as shown above.
+
+Configuration loading is strict and startup fails when a referenced environment variable is missing or empty.
+
+## Local state
+
+The sample uses `store.mode: memory`. Rate, quota, circuit, and dynamic-limit state is lost when the container restarts and is not shared between replicas. For multi-replica deployments, configure Redis; add PostgreSQL only when dynamic limit definitions must survive restarts.
+
+See [Limits and quotas](/guides/limits-and-quotas) and [Operations](/guides/operations) for production state and health guidance.

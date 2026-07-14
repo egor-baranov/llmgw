@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"llmgw/gateway"
 	"llmgw/observer"
 	"llmgw/policy"
+	"llmgw/proxy"
 	"llmgw/store"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -205,6 +207,85 @@ func TestSpecAndDocsEndpoints(t *testing.T) {
 	}
 }
 
+func TestNativeIngressErrorsUseProviderContractsAndRequestIDs(t *testing.T) {
+	ts := newTestServer(t, &captureProvider{name: "anthropic"}, &captureProvider{name: "gemini"})
+	defer ts.Close()
+
+	tests := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{
+			name: "anthropic",
+			path: "/v1/messages",
+			want: []string{`"type":"error"`, `"type":"invalid_request_error"`},
+		},
+		{
+			name: "gemini",
+			path: "/v1beta/models/upstream-gemini:generateContent",
+			want: []string{`"code":400`, `"status":"INVALID_ARGUMENT"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, ts.URL+tt.path, strings.NewReader(`{`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusBadRequest, body)
+			}
+			if resp.Header.Get("X-Request-ID") == "" {
+				t.Fatal("missing X-Request-ID on decode failure")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(string(body), want) {
+					t.Fatalf("native error missing %q: %s", want, body)
+				}
+			}
+		})
+	}
+}
+
+func TestGatewayRequestIDIsNotOverwrittenByUpstream(t *testing.T) {
+	provider := &captureProvider{invoke: func(req *gateway.Request) (*gateway.Result, error) {
+		result := defaultResult(req)
+		result.Headers = http.Header{"X-Request-ID": []string{"provider-request-id"}}
+		return result, nil
+	}}
+	ts := newTestServer(t, provider)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"upstream-demo","messages":[{"role":"user","content":"ping"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Request-ID", "client-request-id")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("X-Request-ID"); got != "client-request-id" {
+		t.Fatalf("X-Request-ID = %q, want gateway/client request id", got)
+	}
+	if got := resp.Header.Get("X-LLMGW-Upstream-Request-ID"); got != "provider-request-id" {
+		t.Fatalf("X-LLMGW-Upstream-Request-ID = %q, want provider request id", got)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	cfg := loadTestConfig(t)
 	cfgStore := gateway.NewConfigStore(cfg)
@@ -231,6 +312,21 @@ func TestMetricsEndpoint(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("chat status = %d, want %d: %s", resp.StatusCode, http.StatusOK, body)
 	}
+	badReq, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed request status = %d, want %d", badResp.StatusCode, http.StatusBadRequest)
+	}
+	if badResp.Header.Get("X-Request-ID") == "" {
+		t.Fatal("malformed request is missing X-Request-ID")
+	}
 
 	metricsResp, err := http.Get(ts.URL + "/metrics")
 	if err != nil {
@@ -252,10 +348,68 @@ func TestMetricsEndpoint(t *testing.T) {
 		`llmgw_requests_total{operation="chat.completions",model="upstream-demo",status="ok"} 1`,
 		"# TYPE llmgw_request_duration_seconds histogram",
 		"llmgw_inflight_requests 0",
+		`llmgw_requests_total{operation="chat.completions",model="unknown",status="error"} 1`,
 	} {
 		if !strings.Contains(string(metricsBody), want) {
 			t.Fatalf("metrics missing %q: %s", want, metricsBody)
 		}
+	}
+}
+
+func TestOperationalEndpointsRequireExplicitPermission(t *testing.T) {
+	cfg := loadTestConfig(t)
+	cfg.Auth.AllowAnonymous = false
+	cfg.Auth.Tokens = map[string]gateway.Principal{
+		"ordinary-token": {ID: "ordinary", KeyID: "ordinary"},
+		"operator-token": {
+			ID:          "operator",
+			KeyID:       "operator",
+			Permissions: []string{gateway.PermissionViewOperations},
+		},
+	}
+	cfgStore := gateway.NewConfigStore(cfg)
+	obsrv := observer.New("llmgw")
+	engine := gateway.NewEngine(cfgStore, []gateway.Provider{&captureProvider{}}, nil, nil)
+	srv := gwapi.NewServer(engine, cfgStore, obsrv, nil, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, path := range []string{"/metrics", "/openapi.yaml", "/openapi.json", "/docs", "/docs/index.html"} {
+		t.Run(path, func(t *testing.T) {
+			request := func(token string) *http.Response {
+				t.Helper()
+				req, err := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if token != "" {
+					req.Header.Set("Authorization", "Bearer "+token)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return resp
+			}
+
+			unauthenticated := request("")
+			_ = unauthenticated.Body.Close()
+			if unauthenticated.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated status = %d, want %d", unauthenticated.StatusCode, http.StatusUnauthorized)
+			}
+
+			ordinary := request("ordinary-token")
+			_ = ordinary.Body.Close()
+			if ordinary.StatusCode != http.StatusForbidden {
+				t.Fatalf("ordinary status = %d, want %d", ordinary.StatusCode, http.StatusForbidden)
+			}
+
+			operator := request("operator-token")
+			_ = operator.Body.Close()
+			if operator.StatusCode < http.StatusOK || operator.StatusCode >= http.StatusBadRequest {
+				t.Fatalf("operator status = %d, want success/redirect", operator.StatusCode)
+			}
+		})
 	}
 }
 
@@ -266,11 +420,12 @@ func TestQuotaLimitsEndpointsUseJWTKeyID(t *testing.T) {
 	ts := newQuotaServer(t, provider, limitStore, quotaStore)
 	defer ts.Close()
 
-	token := signedQuotaJWT(t, "test-secret", jwt.MapClaims{
-		"iss":    "llmgw-tests",
-		"aud":    "gateway",
-		"sub":    "session-1",
-		"key_id": "jwt-key-1",
+	token := signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "session-1",
+		"key_id":      "jwt-key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
 	})
 
 	putReq, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/limits", strings.NewReader(`{
@@ -303,6 +458,7 @@ func TestQuotaLimitsEndpointsUseJWTKeyID(t *testing.T) {
 
 	chatReq, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{
 		"model":"upstream-demo",
+		"max_tokens":100,
 		"messages":[{"role":"user","content":"ping"}]
 	}`))
 	if err != nil {
@@ -394,11 +550,11 @@ func TestQuotaLimitsRejectMissingBearer(t *testing.T) {
 	}
 }
 
-func TestQuotaLimitsRejectJWTWithoutKeyID(t *testing.T) {
+func TestQuotaLimitsRejectJWTWithoutStableIdentity(t *testing.T) {
 	ts := newQuotaServer(t, &captureProvider{}, store.NewMemoryQuotaLimitStore(), store.NewMemoryQuotaStore())
 	defer ts.Close()
 
-	token := signedQuotaJWT(t, "test-secret", jwt.MapClaims{
+	token := signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
 		"iss": "llmgw-tests",
 		"aud": "gateway",
 	})
@@ -414,11 +570,11 @@ func TestQuotaLimitsRejectJWTWithoutKeyID(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusBadRequest, body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusUnauthorized, body)
 	}
-	if !strings.Contains(string(body), `"code":"missing_key_id"`) {
-		t.Fatalf("body = %s, want missing_key_id", body)
+	if !strings.Contains(string(body), `"code":"unauthorized"`) {
+		t.Fatalf("body = %s, want unauthorized", body)
 	}
 }
 
@@ -426,11 +582,12 @@ func TestQuotaLimitsPutRejectsInvalidPayload(t *testing.T) {
 	ts := newQuotaServer(t, &captureProvider{}, store.NewMemoryQuotaLimitStore(), store.NewMemoryQuotaStore())
 	defer ts.Close()
 
-	token := signedQuotaJWT(t, "test-secret", jwt.MapClaims{
-		"iss":    "llmgw-tests",
-		"aud":    "gateway",
-		"sub":    "session-1",
-		"key_id": "jwt-key-1",
+	token := signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "session-1",
+		"key_id":      "jwt-key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
 	})
 
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/limits", strings.NewReader(`{"rpm":-1}`))
@@ -468,11 +625,12 @@ func TestQuotaLimitsPutRejectsWhenDynamicStoreDisabled(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	token := signedQuotaJWT(t, "test-secret", jwt.MapClaims{
-		"iss":    "llmgw-tests",
-		"aud":    "gateway",
-		"sub":    "session-1",
-		"key_id": "jwt-key-1",
+	token := signedQuotaJWT(t, "test-secret-that-is-at-least-32-bytes", jwt.MapClaims{
+		"iss":         "llmgw-tests",
+		"aud":         "gateway",
+		"sub":         "session-1",
+		"key_id":      "jwt-key-1",
+		"permissions": []string{gateway.PermissionManageLimits},
 	})
 
 	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/limits", strings.NewReader(`{"rpm":10}`))
@@ -670,6 +828,83 @@ func TestStreamingEndpoints(t *testing.T) {
 	}
 }
 
+func TestLegacyCompletionStreamsThroughChatOnlyOpenAIRoute(t *testing.T) {
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"+
+				"data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	snapshot := &gateway.Snapshot{
+		Auth: gateway.AuthConfig{AllowAnonymous: true, MaxBodyBytes: 1 << 20},
+		Routes: map[string]*gateway.Route{
+			"chat-only": {
+				Name: "chat-only", Provider: "openai", BaseURL: upstream.URL + "/v1",
+				Model: "public-alias", UpstreamModel: "upstream-chat",
+				Capabilities: gateway.Capability{
+					Operations: []gateway.Operation{gateway.OpChatCompletions},
+					Streaming:  true,
+				},
+			},
+		},
+	}
+	cfg := gateway.NewConfigStore(snapshot)
+	provider := proxy.NewProvider(proxy.OpenAIAdapter(), upstream.Client())
+	engine := gateway.NewEngine(cfg, []gateway.Provider{provider}, []gateway.RequestInterceptor{
+		gateway.NewCandidatePreflight([]gateway.Provider{provider}),
+	}, nil)
+	server := httptest.NewServer(gwapi.NewServer(engine, cfg, nil, nil, nil).Handler())
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/completions", "application/json", strings.NewReader(`{
+		"model":"public-alias","prompt":"say hello","stream":true
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content type = %q, want text/event-stream", got)
+	}
+	for _, want := range []string{`"object":"text_completion"`, `"model":"public-alias"`, `"text":"hello"`, `"choices":[]`, "data: [DONE]"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("bridged response missing %q: %s", want, body)
+		}
+	}
+	var forwarded map[string]json.RawMessage
+	if err := json.Unmarshal(upstreamBody, &forwarded); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if got := string(forwarded["model"]); got != `"upstream-chat"` {
+		t.Fatalf("forwarded model = %s, want upstream-chat", got)
+	}
+	var streamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	if err := json.Unmarshal(forwarded["stream_options"], &streamOptions); err != nil || !streamOptions.IncludeUsage {
+		t.Fatalf("forwarded stream_options = %s, want include_usage=true", forwarded["stream_options"])
+	}
+}
+
 func TestProviderNativeAnthropicEndpoint(t *testing.T) {
 	provider := &captureProvider{name: "anthropic"}
 	ts := newTestServer(t, provider)
@@ -677,6 +912,7 @@ func TestProviderNativeAnthropicEndpoint(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{
 		"model":"upstream-anthropic",
+		"max_tokens":64,
 		"messages":[{"role":"user","content":"ping"}]
 	}`))
 	if err != nil {
@@ -887,8 +1123,8 @@ func TestProviderNativeGeminiInvalidPath(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", resp.StatusCode, http.StatusNotFound, body)
 	}
-	if !strings.Contains(string(body), `"code":"not_found"`) {
-		t.Fatalf("body = %s, want not_found", body)
+	if !strings.Contains(string(body), `"status":"NOT_FOUND"`) {
+		t.Fatalf("body = %s, want Gemini NOT_FOUND status", body)
 	}
 	if provider.last() != nil {
 		t.Fatal("provider should not be invoked for unknown gemini operation")
@@ -903,6 +1139,7 @@ func TestProviderNativeRoutingFiltersByProvider(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{
 		"model":"shared-model",
+		"max_tokens":64,
 		"messages":[{"role":"user","content":"ping"}]
 	}`))
 	if err != nil {
@@ -949,6 +1186,7 @@ func TestProviderNativeStreamingPassesThroughAnthropic(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/messages", strings.NewReader(`{
 		"model":"upstream-anthropic",
+		"max_tokens":64,
 		"stream":true,
 		"messages":[{"role":"user","content":"ping"}]
 	}`))
@@ -1122,6 +1360,7 @@ func loadTestConfig(t *testing.T) *gateway.Snapshot {
 server:
   listen: ":0"
 auth:
+  allow_anonymous: true
   max_body_bytes: 1048576
 store:
   mode: memory
@@ -1132,6 +1371,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions, responses, completions, embeddings]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       streaming: true
       tool_calling: true
       structured_output: true
@@ -1142,6 +1383,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       streaming: true
       tool_calling: true
       structured_output: true
@@ -1152,6 +1395,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       tool_calling: true
       structured_output: true
       reasoning: true
@@ -1161,18 +1406,22 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [embeddings]
+      tokenizer: cl100k_base
   gemini-embed-v1-route:
     provider: gemini
     model: upstream-gemini-embed-v1
     base_url: http://example.invalid/v1
     capabilities:
       operations: [embeddings]
+      tokenizer: cl100k_base
   shared-openai-route:
     provider: openai
     model: shared-model
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       tool_calling: true
       structured_output: true
       reasoning: true
@@ -1182,6 +1431,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       tool_calling: true
       structured_output: true
       reasoning: true
@@ -1209,7 +1460,7 @@ auth:
     algorithm: HS256
     issuer: llmgw-tests
     audience: gateway
-    secret: test-secret
+    secret: test-secret-that-is-at-least-32-bytes
     claims:
       principal: sub
       key_id: key_id
@@ -1222,6 +1473,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       streaming: true
       tool_calling: true
       structured_output: true
@@ -1269,6 +1522,8 @@ routes:
     base_url: http://example.invalid/v1
     capabilities:
       operations: [chat.completions]
+      max_output_tokens: 4096
+      tokenizer: cl100k_base
       streaming: true
       tool_calling: true
       structured_output: true
@@ -1295,7 +1550,7 @@ func defaultResult(req *gateway.Request) *gateway.Result {
 		}
 		return rawJSONResult(`{"id":"chat_1","object":"chat.completion","model":"`+req.Model+`","created":1,"choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, gateway.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
 	case gateway.OpResponses:
-		return rawJSONResult(`{"id":"resp_1","object":"response","model":"`+req.Model+`","created":1,"status":"completed","output_text":"pong","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, gateway.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
+		return rawJSONResult(`{"id":"resp_1","object":"response","model":"`+req.Model+`","created_at":1,"status":"completed","output_text":"pong","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, gateway.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
 	case gateway.OpCompletions:
 		return rawJSONResult(`{"id":"cmpl_1","object":"text_completion","model":"`+req.Model+`","created":1,"choices":[{"index":0,"text":"pong","finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, gateway.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2})
 	case gateway.OpEmbeddings:

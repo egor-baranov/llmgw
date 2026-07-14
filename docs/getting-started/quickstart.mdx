@@ -1,0 +1,141 @@
+---
+title: "Quickstart"
+description: "Run llmgw from source and send your first OpenAI-compatible request."
+---
+
+llmgw is a provider-native LLM data plane. Clients send OpenAI, Anthropic, or Gemini wire formats to one service; the gateway authenticates the caller, applies policy and quota controls, chooses a compatible route, and proxies the request upstream.
+
+## Prerequisites
+
+- Go 1.24 or newer
+- An API key for every provider route enabled in your configuration
+- `curl`
+- OpenSSL, or another way to generate a high-entropy gateway token
+
+The checked-in example enables OpenAI, Anthropic, and Gemini, so it expects all three provider keys.
+
+<Steps>
+  <Step title="Set credentials">
+
+```bash
+export OPENAI_API_KEY="..."
+export ANTHROPIC_API_KEY="..."
+export GEMINI_API_KEY="..."
+export LLMGW_BEARER_TOKEN="$(openssl rand -hex 32)"
+```
+
+`LLMGW_BEARER_TOKEN` authenticates clients to llmgw. The provider variables authenticate llmgw to the upstream APIs. Client credentials are consumed at ingress and are never reused as upstream credentials.
+
+  </Step>
+  <Step title="Start the gateway">
+
+From the repository root:
+
+```bash
+go run ./cmd/llmgw -config config/config.example.yaml
+```
+
+The default listener is `http://localhost:8080`.
+
+  </Step>
+  <Step title="Check readiness">
+
+```bash
+curl --fail http://localhost:8080/readyz
+```
+
+```json
+{"ready":true}
+```
+
+`/healthz` only confirms that the process is alive. `/readyz` also verifies the loaded configuration and configured state-store dependencies.
+
+  </Step>
+  <Step title="Discover available models">
+
+```bash
+curl --fail --silent http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+The response is filtered by the caller's model/provider ACL and quota allowlists.
+
+  </Step>
+  <Step title="Send your first request">
+
+```bash
+curl --fail --silent http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [
+      {"role": "user", "content": "Explain what an LLM gateway does in one sentence."}
+    ]
+  }'
+```
+
+The public `model` value is a gateway alias. A route may map it to a different provider model with `upstream_model`.
+
+  </Step>
+</Steps>
+
+## Try another native protocol
+
+Provider-native clients can keep their existing request format and change only the base URL and gateway credential.
+
+<Tabs>
+  <Tab title="Anthropic">
+
+```bash
+curl --fail --silent http://localhost:8080/v1/messages \
+  -H "x-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}]
+  }'
+```
+
+  </Tab>
+  <Tab title="Gemini">
+
+```bash
+curl --fail --silent \
+  http://localhost:8080/v1beta/models/gemini-2.5-flash:generateContent \
+  -H "x-goog-api-key: $LLMGW_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Say hello in one sentence."}]}
+    ]
+  }'
+```
+
+  </Tab>
+</Tabs>
+
+<Note>
+`Authorization: Bearer ...` works on every inference surface. Anthropic additionally accepts `x-api-key`, and Gemini additionally accepts `x-goog-api-key`, which lets existing native clients retain their credential header.
+</Note>
+
+## Explore the running API
+
+The service publishes a live, configuration-aware OpenAPI document and Swagger UI:
+
+```bash
+curl --silent http://localhost:8080/openapi.yaml \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+Open `http://localhost:8080/docs` through a browser or reverse proxy that supplies the bearer token. The example token has the required `view_operations` permission. This is the running gateway's Swagger UI; it is separate from the Mintlify documentation development server at `http://localhost:3000`.
+
+<CardGroup cols={2}>
+  <Card title="Configure llmgw" icon="gear" href="/guides/configuration">
+    Define authentication, routes, capabilities, stores, and quotas.
+  </Card>
+  <Card title="API overview" icon="code" href="/api-reference/overview">
+    See every public endpoint and its authentication contract.
+  </Card>
+</CardGroup>

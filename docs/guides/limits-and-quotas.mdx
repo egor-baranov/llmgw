@@ -1,0 +1,159 @@
+---
+title: "Limits and quotas"
+description: "Control client consumption and protect routes with key quotas, attempt guards, capabilities, and accounting."
+---
+
+llmgw applies limits at different scopes. Keep them separate in your mental model:
+
+1. **Key quotas** control what one authenticated quota key may consume per logical request.
+2. **Route/provider guards** protect upstream capacity on each attempt, retry, and fallback.
+3. **Capabilities** reject requests a route cannot perform.
+4. **Request guards** enforce body size and required identity metadata.
+
+## Key-scoped quota fields
+
+| Field | Meaning |
+| --- | --- |
+| `rpm` | Logical requests admitted in the current minute bucket |
+| `tpm` | Estimated/reserved tokens admitted in the current minute bucket |
+| `max_parallel` | Concurrent logical requests for the key |
+| `max_spend_micros` | Hard spend ceiling for the configured budget bucket |
+| `soft_spend_micros` | Observable warning threshold; it does not reject traffic |
+| `daily_tokens` | Token ceiling for the current daily bucket |
+| `monthly_tokens` | Token ceiling for the current monthly bucket |
+| `budget_duration` | Go duration for a fixed UTC-aligned spend bucket; omitted/zero is lifetime |
+| `max_input_tokens` | Maximum estimated input for one request |
+| `max_output_tokens` | Maximum requested/effective output for one request |
+| `model_allowlist` | Allowed public model aliases |
+| `provider_allowlist` | Allowed configured providers |
+
+A zero numeric value disables that particular limit. Values cannot be negative, and `soft_spend_micros` cannot exceed a non-zero hard spend limit.
+
+## Configure static profiles
+
+```yaml
+quota:
+  profiles:
+    standard:
+      rpm: 120
+      tpm: 500000
+      max_parallel: 8
+      daily_tokens: 2000000
+      monthly_tokens: 40000000
+      max_input_tokens: 128000
+      max_output_tokens: 8192
+      model_allowlist: [fast-chat]
+      provider_allowlist: [openai]
+  keys:
+    customer-42-key: standard
+
+auth:
+  token_envs:
+    CUSTOMER_42_TOKEN:
+      id: customer-42
+      key_id: customer-42-key
+      providers: [openai]
+      models: [fast-chat]
+```
+
+The principal `key_id` selects the entry in `quota.keys`, which names a profile. A principal with no matching profile can still make requests, subject to ACLs and route/provider guards.
+
+## Read effective limits
+
+```bash
+curl --silent http://localhost:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_BEARER_TOKEN"
+```
+
+Example response:
+
+```json
+{
+  "key_id": "dev-key",
+  "source": "config",
+  "limits": {
+    "max_parallel": 32,
+    "daily_tokens": 1000000
+  },
+  "usage": {
+    "active_requests": 1,
+    "rpm_current": 4,
+    "tpm_current": 1320,
+    "daily_used_tokens": 7820,
+    "daily_held_tokens": 1024
+  }
+}
+```
+
+`source` is `config` for a static profile and `dynamic` for an override. If the limit definition is available but the live usage lookup fails, the endpoint still returns `200` with `usage_unavailable: true`.
+
+If no static or dynamic limits exist for the key, the endpoint returns `404` with `quota_limits_not_found`.
+
+## Set a dynamic override
+
+`PUT /v1/limits` replaces the complete dynamic limit object for the caller's own effective quota key. It requires `manage_limits`.
+
+```bash
+curl --silent --request PUT http://localhost:8080/v1/limits \
+  -H "Authorization: Bearer $LLMGW_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rpm": 240,
+    "tpm": 1000000,
+    "max_parallel": 16,
+    "daily_tokens": 4000000,
+    "model_allowlist": ["fast-chat"],
+    "provider_allowlist": ["openai"]
+  }'
+```
+
+Unknown JSON fields, negative values, and providers with no configured route are rejected. A dynamic override takes precedence over config until it is replaced. There is no delete endpoint.
+
+<Warning>
+Without PostgreSQL, dynamic overrides are process-local and disappear on restart in either hot-path store mode. Configure `store.postgres_dsn_env` for durable definitions. The service reads them through a refreshed in-memory snapshot, not SQL on the inference path.
+</Warning>
+
+## Reservation and settlement
+
+Quota accounting uses estimate → reserve → dispatch → settle:
+
+1. Estimate input tokens and effective maximum output for each compatible route.
+2. Reserve request-level RPM/concurrency and create the idempotent ticket without pre-authorizing a route that may never run.
+3. Immediately before every real retry or fallback call, top up the ticket with that route's conservative token/spend estimate.
+4. Commit provider-reported actual usage when available.
+5. Refund unused reservations; retain conservative estimates when usage is missing or an interrupted stream is partial.
+
+If the client omits an output maximum, a generative route's `capabilities.max_output_tokens` is reserved. OpenAI `n`, legacy `best_of`, and Gemini `candidateCount` multiply the output reservation.
+
+## Spend accounting
+
+Route pricing supports input, output, prompt-cache read/write, and provider-metered units. Spend is stored as integer micros and rounded per provider attempt.
+
+Hard spend policy is reliable only when all eligible routes have complete pricing. Missing token pricing remains non-fatal even with a hard spend ceiling, but produces zero calculated spend and therefore weakens that ceiling. Hosted tools under a hard spend quota need both positive `micros_per_unit` and positive `max_units_per_request`; otherwise the candidate is rejected before dispatch.
+
+## Route and provider guards
+
+These route fields apply to each attempt:
+
+```yaml
+limits:
+  rpm: 3000
+  tpm: 2000000
+  concurrency: 256
+  provider_concurrency: 256
+  max_body_bytes: 4194304
+  max_response_bytes: 16777216
+```
+
+- `concurrency` protects one route.
+- `provider_concurrency` protects the provider across routes and must be consistent for that provider.
+- `rpm` and `tpm` protect the upstream attempt budget.
+- Body and response byte caps bound memory/network work.
+
+In-memory mode applies these within one process. Redis mode shares route/provider concurrency, breaker state, rate controls, and quota reservations across instances.
+
+## Capability and request guards
+
+Capability checks filter routes before dispatch for operation, streaming, tools, structured output, vision, audio, reasoning, and token caps. Global `auth.max_body_bytes` runs at ingress, while route body limits filter candidates. `auth.require_user` and `auth.require_project` enforce attribution metadata.
+
+When a request is rejected, see the response's `error.code` and `X-Request-ID`; [Troubleshooting](/guides/troubleshooting) maps the common failures.

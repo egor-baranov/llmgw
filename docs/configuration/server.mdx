@@ -1,0 +1,78 @@
+---
+title: Server
+description: Configure the listener, HTTP deadlines, streaming writes, and graceful shutdown.
+---
+
+The `server` section controls the public HTTP listener. These settings are read when the service starts and are **restart-only**.
+
+```yaml
+server:
+  listen: ":8080"
+  read_timeout: 15s
+  write_timeout: 0s
+  stream_write_timeout: 30s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+```
+
+## Fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `listen` | string | `:8080` | Address passed to the TCP listener. Examples: `:8080`, `127.0.0.1:8080`, or `[::1]:8080`. |
+| `read_timeout` | duration | `15s` | HTTP request read timeout. It is also used as the request-header timeout. |
+| `write_timeout` | duration | `0s` | Go HTTP server write timeout. Zero disables the server-wide write deadline. |
+| `stream_write_timeout` | duration | `30s` | Downstream write-idle deadline used while writing a unary response and for each SSE chunk. |
+| `idle_timeout` | duration | `60s` | Maximum keep-alive idle time between requests. |
+| `shutdown_timeout` | duration | `10s` | Deadline used for graceful HTTP shutdown after `SIGINT` or `SIGTERM`. |
+
+Durations must be non-negative and use Go syntax. An explicit zero receives the documented default except for `write_timeout`, which intentionally remains disabled.
+
+## Streaming guidance
+
+For long-lived SSE responses, keep `write_timeout: 0s` unless you intentionally want one fixed deadline for the entire HTTP response. `stream_write_timeout` is the more targeted safeguard: it resets around downstream writes, so an actively streaming response can run longer than the configured interval while a stalled client is eventually disconnected.
+
+```yaml
+server:
+  write_timeout: 0s
+  stream_write_timeout: 20s
+```
+
+Provider call duration is separate. Configure that per route with `routes.<name>.timeout`; see [Routes](/configuration/routes#attempt-controls).
+
+## Health and operational endpoints
+
+The listener exposes:
+
+| Endpoint | Authentication | Meaning |
+| --- | --- | --- |
+| `GET /healthz` | None | Process liveness. Returns success while the HTTP process is running. |
+| `GET /readyz` | None | Configuration is loaded and runtime store checks pass within two seconds. Redis is pinged; a PostgreSQL-backed limit store checks its usable local snapshot rather than querying PostgreSQL on every probe. |
+| `GET /metrics` | `view_operations`, unless anonymous mode is enabled | Prometheus-format metrics. |
+| `GET /openapi.yaml` and `GET /openapi.json` | `view_operations`, unless anonymous mode is enabled | OpenAPI generated from the active configuration. |
+| `GET /docs/` | `view_operations`, unless anonymous mode is enabled | Embedded Swagger UI for the service API. |
+
+<Note>
+  `/healthz` and `/readyz` deliberately remain unauthenticated for orchestrator probes. Restrict network access to the listener if even basic service availability must not be public.
+</Note>
+
+## Graceful shutdown
+
+On `SIGINT` or `SIGTERM`, llmgw:
+
+1. Stops accepting new connections.
+2. Allows active HTTP requests to finish until `shutdown_timeout` expires.
+3. Closes the listener and store connections.
+
+`SIGHUP` has different behavior: it attempts an in-place configuration reload without stopping the server. See [Reload and validation](/configuration/reload-and-validation).
+
+## Binding safely
+
+For development, bind to loopback:
+
+```yaml
+server:
+  listen: 127.0.0.1:8080
+```
+
+For a container behind a trusted reverse proxy, `:8080` is conventional. llmgw itself does not configure inbound TLS, client certificate authentication, or proxy trust. Terminate TLS and enforce any network-layer policy at your ingress, load balancer, or service mesh.
